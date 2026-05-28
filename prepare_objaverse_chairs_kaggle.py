@@ -422,6 +422,89 @@ def render_still_checked(path):
     return stats
 
 
+def save_rgba_png(path, rgba):
+    image = bpy.data.images.new(name=Path(path).stem, width=rgba.shape[1], height=rgba.shape[0], alpha=True)
+    try:
+        image.pixels = rgba[::-1, :, :].reshape(-1).astype(np.float32).tolist()
+        image.filepath_raw = str(path)
+        image.file_format = "PNG"
+        image.save()
+    finally:
+        bpy.data.images.remove(image)
+
+
+def software_point_render(path, camera, points, normals, resolution):
+    scale = float(camera.data.ortho_scale)
+    matrix_inv = camera.matrix_world.inverted()
+    rot_inv = matrix_inv.to_3x3()
+
+    cam_points = np.empty_like(points, dtype=np.float32)
+    cam_normals = np.empty_like(normals, dtype=np.float32)
+    for i, point in enumerate(points):
+        v = matrix_inv @ mathutils.Vector((float(point[0]), float(point[1]), float(point[2])))
+        cam_points[i] = (v.x, v.y, v.z)
+    for i, normal in enumerate(normals):
+        n = rot_inv @ mathutils.Vector((float(normal[0]), float(normal[1]), float(normal[2])))
+        cam_normals[i] = (n.x, n.y, n.z)
+
+    x = ((cam_points[:, 0] / scale) + 0.5) * resolution
+    y = (0.5 - (cam_points[:, 1] / scale)) * resolution
+    depth = -cam_points[:, 2]
+    valid = (depth > 0) & (x >= -3) & (x < resolution + 3) & (y >= -3) & (y < resolution + 3)
+    if not np.any(valid):
+        raise RuntimeError("Software renderer found no projected points in frame")
+
+    x = x[valid].astype(np.int32)
+    y = y[valid].astype(np.int32)
+    depth = depth[valid]
+    cam_normals = cam_normals[valid]
+
+    order = np.argsort(depth)[::-1]
+    x = x[order]
+    y = y[order]
+    depth = depth[order]
+    cam_normals = cam_normals[order]
+
+    rgba = np.ones((resolution, resolution, 4), dtype=np.float32)
+    rgba[:, :, 0] = 0.78
+    rgba[:, :, 1] = 0.80
+    rgba[:, :, 2] = 0.82
+    zbuf = np.full((resolution, resolution), np.inf, dtype=np.float32)
+
+    base = np.array([0.82, 0.78, 0.68], dtype=np.float32)
+    light = np.array([0.2, -0.35, 0.92], dtype=np.float32)
+    light = light / np.linalg.norm(light)
+    radius_px = max(1, resolution // 160)
+
+    for px, py, z, normal in zip(x, y, depth, cam_normals):
+        if z <= 0:
+            continue
+        n_norm = np.linalg.norm(normal)
+        if n_norm > 1e-6:
+            normal = normal / n_norm
+        shade = 0.58 + 0.42 * max(0.0, float(np.dot(normal, light)))
+        color = np.clip(base * shade, 0.0, 1.0)
+        x0 = max(0, px - radius_px)
+        x1 = min(resolution - 1, px + radius_px)
+        y0 = max(0, py - radius_px)
+        y1 = min(resolution - 1, py + radius_px)
+        for yy in range(y0, y1 + 1):
+            for xx in range(x0, x1 + 1):
+                if z < zbuf[yy, xx]:
+                    zbuf[yy, xx] = z
+                    rgba[yy, xx, 0:3] = color
+
+    if float(np.max(rgba[:, :, 0:3])) < 0.05:
+        raise RuntimeError("Software renderer produced a nearly black image")
+    save_rgba_png(path, rgba)
+    rgb = rgba[:, :, 0:3]
+    return {
+        "mean_rgb": float(np.mean(rgb)),
+        "max_rgb": float(np.max(rgb)),
+        "mean_alpha": float(np.mean(rgba[:, :, 3])),
+    }
+
+
 def export_normalized_glb(path):
     bpy.ops.object.select_all(action="DESELECT")
     for obj in mesh_objects():
@@ -499,7 +582,7 @@ def sample_surface_points(count):
     return points.astype(np.float32), normals_chosen.astype(np.float32)
 
 
-def render_views(uid, out_dir, views, resolution, radius, elevation_min, elevation_max, seed, bbox):
+def render_views(uid, out_dir, views, resolution, radius, elevation_min, elevation_max, seed, bbox, points, normals):
     render_dir = out_dir / "renders" / uid
     render_dir.mkdir(parents=True, exist_ok=True)
     camera = make_camera()
@@ -525,7 +608,7 @@ def render_views(uid, out_dir, views, resolution, radius, elevation_min, elevati
         look_at(camera, target)
 
         png_path = render_dir / f"view_{view_idx:03d}.png"
-        render_stats = render_still_checked(png_path)
+        render_stats = software_point_render(png_path, camera, points, normals, resolution)
 
         view_rows.append({
             "uid": uid,
@@ -583,6 +666,8 @@ def process_one(entry, out_dir, args, index):
         elevation_max=args.elevation_max,
         seed=args.seed + index,
         bbox=bbox,
+        points=points,
+        normals=normals,
     )
     return {
         "uid": uid,
@@ -1285,7 +1370,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--download_processes", type=int, default=8)
     parser.add_argument("--views", type=int, default=12)
     parser.add_argument("--resolution", type=int, default=256)
-    parser.add_argument("--points", type=int, default=8192)
+    parser.add_argument("--points", type=int, default=32768)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--categories", default=",".join(DEFAULT_CATEGORIES))
     parser.add_argument(
