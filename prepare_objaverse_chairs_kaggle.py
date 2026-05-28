@@ -67,6 +67,16 @@ import sys
 import traceback
 from pathlib import Path
 
+for _site_path in (
+    "/usr/lib/python3/dist-packages",
+    "/usr/local/lib/python3.10/dist-packages",
+    "/usr/lib/python3.10/dist-packages",
+    "/usr/local/lib/python3.11/dist-packages",
+    "/usr/lib/python3.11/dist-packages",
+):
+    if os.path.isdir(_site_path) and _site_path not in sys.path:
+        sys.path.append(_site_path)
+
 import bpy
 import mathutils
 import numpy as np
@@ -540,7 +550,7 @@ def try_install_blender_with_apt() -> Path | None:
     print("Blender executable was not found. Trying apt-get install blender...", flush=True)
     commands = [
         ["apt-get", "update", "-qq"],
-        ["apt-get", "install", "-y", "-qq", "blender"],
+        ["apt-get", "install", "-y", "-qq", "blender", "python3-numpy"],
     ]
     for cmd in commands:
         result = subprocess.run(cmd, check=False)
@@ -584,6 +594,9 @@ def download_with_progress(url: str, dst: Path) -> None:
 def ensure_blender(blender_dir: Path, version: str, skip_download: bool, skip_apt: bool) -> Path:
     blender = find_blender(blender_dir)
     if blender:
+        if not skip_apt and str(blender) == "/usr/bin/blender":
+            try_install_blender_with_apt()
+            blender = find_blender(blender_dir) or blender
         print(f"Using Blender: {blender}", flush=True)
         return blender
 
@@ -988,6 +1001,16 @@ def build_dataset(args: argparse.Namespace) -> None:
         # The worker writes chunk CSVs into metadata/. Move them through a stable
         # temporary location before appending, so reruns remain resumable.
         run(cmd, env=env)
+        chunk_outputs = [
+            metadata_dir / "objects_chunk.csv",
+            metadata_dir / "views_chunk.csv",
+            metadata_dir / "failed_chunk.csv",
+        ]
+        if not any(path.exists() and path.stat().st_size > 0 for path in chunk_outputs):
+            raise RuntimeError(
+                "Blender worker did not produce any chunk metadata. "
+                "Check the Blender log above; the worker likely crashed before processing objects."
+            )
 
         append_csv(metadata_dir / "objects_chunk.csv", metadata_dir / "objects.csv")
         append_csv(metadata_dir / "views_chunk.csv", metadata_dir / "views.csv")
