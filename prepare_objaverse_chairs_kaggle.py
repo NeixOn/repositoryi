@@ -849,9 +849,32 @@ def configure_kaggle_credentials(args: argparse.Namespace) -> None:
     if os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY"):
         return
 
+    try:
+        from kaggle_secrets import UserSecretsClient
+
+        secrets = UserSecretsClient()
+        for username_name, key_name in (
+            ("KAGGLE_USERNAME", "KAGGLE_KEY"),
+            ("kaggle_username", "kaggle_key"),
+            ("KAGGLE_USER", "KAGGLE_API_KEY"),
+        ):
+            try:
+                username = secrets.get_secret(username_name)
+                key = secrets.get_secret(key_name)
+            except Exception:
+                continue
+            if username and key:
+                os.environ["KAGGLE_USERNAME"] = username
+                os.environ["KAGGLE_KEY"] = key
+                print(f"Using Kaggle API credentials from Secrets: {username_name}/{key_name}", flush=True)
+                return
+    except Exception:
+        pass
+
     explicit = Path(args.kaggle_json_path).expanduser() if args.kaggle_json_path else None
     if explicit and explicit.exists():
         install_kaggle_json(explicit)
+        print(f"Using Kaggle API token from {explicit}", flush=True)
         return
 
     existing = Path.home() / ".kaggle" / "kaggle.json"
@@ -871,6 +894,10 @@ def configure_kaggle_credentials(args: argparse.Namespace) -> None:
             install_kaggle_json(matches[0])
             print(f"Using Kaggle API token from {matches[0]}", flush=True)
             return
+    print(
+        "Kaggle API credentials were not found in environment, Kaggle Secrets, /root/.kaggle, /kaggle/working, or /kaggle/input.",
+        flush=True,
+    )
 
 
 def kaggle_credentials_available() -> bool:
@@ -1023,8 +1050,7 @@ def build_dataset(args: argparse.Namespace) -> None:
         if not entries:
             continue
 
-        # Process only a little more than needed, because some objects will be rejected.
-        entries = entries[: max(remaining * 2, min(len(entries), args.download_batch))]
+        entries = entries[:remaining]
         manifest = output_dir / "_scripts" / "chunk_manifest.json"
         manifest.write_text(json.dumps(entries, ensure_ascii=True, indent=2), encoding="utf-8")
 
