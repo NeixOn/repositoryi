@@ -1036,13 +1036,62 @@ def python_normalize_mesh(mesh):
     }
 
 
-def python_sample_surface(mesh, count: int):
+def python_mesh_visual_colors(mesh, color_mode: str):
+    import numpy as np
+
+    fallback = np.array([0.84, 0.78, 0.66], dtype=np.float32)
+    if color_mode == "clay":
+        return None, fallback
+    visual = getattr(mesh, "visual", None)
+    if visual is None:
+        return None, fallback
+
+    kind = getattr(visual, "kind", None)
+    if kind == "vertex":
+        colors = np.asarray(visual.vertex_colors, dtype=np.float32)
+        if len(colors) == len(mesh.vertices):
+            colors = colors[:, :3] / 255.0
+            if float(colors.max() - colors.min()) > 0.02:
+                return ("vertex", colors), fallback
+    if kind == "face":
+        colors = np.asarray(visual.face_colors, dtype=np.float32)
+        if len(colors) == len(mesh.faces):
+            colors = colors[:, :3] / 255.0
+            if float(colors.max() - colors.min()) > 0.02:
+                return ("face", colors), fallback
+
+    material = getattr(visual, "material", None)
+    for attr in ("baseColorFactor", "diffuse", "main_color"):
+        value = getattr(material, attr, None) if material is not None else None
+        if value is not None:
+            color = np.asarray(value, dtype=np.float32).reshape(-1)
+            if len(color) >= 3:
+                color = color[:3]
+                if color.max() > 1.0:
+                    color = color / 255.0
+                return None, np.clip(color, 0.05, 1.0).astype(np.float32)
+    return None, fallback
+
+
+def python_sample_surface(mesh, count: int, color_mode: str):
     import numpy as np
     import trimesh
 
     points, face_index = trimesh.sample.sample_surface(mesh, count)
     normals = np.asarray(mesh.face_normals[face_index], dtype=np.float32)
-    return np.asarray(points, dtype=np.float32), normals
+    color_source, fallback_color = python_mesh_visual_colors(mesh, color_mode)
+    if color_source is None:
+        colors = np.tile(fallback_color.reshape(1, 3), (len(points), 1)).astype(np.float32)
+    else:
+        mode, color_data = color_source
+        if mode == "face":
+            colors = color_data[face_index].astype(np.float32)
+        else:
+            faces = np.asarray(mesh.faces[face_index], dtype=np.int64)
+            colors = color_data[faces].mean(axis=1).astype(np.float32)
+    if color_mode == "normal":
+        colors = np.clip((normals + 1.0) * 0.5, 0.0, 1.0).astype(np.float32)
+    return np.asarray(points, dtype=np.float32), normals, colors
 
 
 def python_camera_matrix(location, target):
@@ -1066,7 +1115,7 @@ def python_camera_matrix(location, target):
     return matrix
 
 
-def python_render_points(path: Path, points, normals, camera_matrix, ortho_scale: float, resolution: int):
+def python_render_points(path: Path, points, normals, colors, camera_matrix, ortho_scale: float, resolution: int):
     import numpy as np
     from PIL import Image
 
@@ -1087,6 +1136,7 @@ def python_render_points(path: Path, points, normals, camera_matrix, ortho_scale
     y = np.clip(y[valid].astype(np.int32), 0, resolution - 1)
     depth = depth[valid]
     cam_normals = cam_normals[valid]
+    colors = colors[valid]
     order = np.argsort(depth)[::-1]
 
     rgb = np.zeros((resolution, resolution, 3), dtype=np.float32)
@@ -1094,7 +1144,6 @@ def python_render_points(path: Path, points, normals, camera_matrix, ortho_scale
     zbuf = np.full((resolution, resolution), np.inf, dtype=np.float64)
     light = np.array([0.25, -0.35, 0.9], dtype=np.float64)
     light /= np.linalg.norm(light)
-    base = np.array([0.84, 0.78, 0.66], dtype=np.float32)
     radius = max(1, resolution // 128)
 
     for idx in order:
@@ -1106,6 +1155,10 @@ def python_render_points(path: Path, points, normals, camera_matrix, ortho_scale
         if normal_norm > 1e-9:
             normal = normal / normal_norm
         shade = 0.62 + 0.38 * max(0.0, float(np.dot(normal, light)))
+        base = colors[idx].astype(np.float32)
+        if float(base.max() - base.min()) < 0.01:
+            hue = 0.08 + 0.84 * ((abs(float(normal[0])) * 0.37 + abs(float(normal[1])) * 0.41 + abs(float(normal[2])) * 0.22) % 1.0)
+            base = np.clip(base * (0.72 + 0.28 * hue), 0.0, 1.0)
         color = np.clip(base * shade, 0.0, 1.0)
         for yy in range(max(0, py - radius), min(resolution, py + radius + 1)):
             for xx in range(max(0, px - radius), min(resolution, px + radius + 1)):
@@ -1143,9 +1196,9 @@ def python_process_one(entry: dict, output_dir: Path, args: argparse.Namespace, 
     normalized_path = object_dir / "normalized.glb"
     mesh.export(normalized_path)
 
-    points, normals = python_sample_surface(mesh, args.points)
+    points, normals, colors = python_sample_surface(mesh, args.points, args.color_mode)
     points_path = object_dir / "points.npz"
-    np.savez_compressed(points_path, points=points, normals=normals)
+    np.savez_compressed(points_path, points=points, normals=normals, colors=colors)
 
     render_dir = output_dir / "renders" / uid
     target = np.asarray(bbox["bbox_center"], dtype=np.float64)
@@ -1167,7 +1220,7 @@ def python_process_one(entry: dict, output_dir: Path, args: argparse.Namespace, 
         ])
         camera_matrix = python_camera_matrix(location, target)
         image_path = render_dir / f"view_{view_idx:03d}.png"
-        stats = python_render_points(image_path, points, normals, camera_matrix, ortho_scale, args.resolution)
+        stats = python_render_points(image_path, points, normals, colors, camera_matrix, ortho_scale, args.resolution)
         focal_like = args.resolution / ortho_scale
         rows.append({
             "uid": uid,
@@ -1633,6 +1686,12 @@ def parse_args() -> argparse.Namespace:
         choices=("python", "blender"),
         default="python",
         help="Use python for a Blender-free trimesh renderer, or blender for the legacy Blender worker.",
+    )
+    parser.add_argument(
+        "--color_mode",
+        choices=("asset", "normal", "clay"),
+        default="asset",
+        help="Color PNG renders from mesh asset colors when available, normals, or a single clay color.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--categories", default=",".join(DEFAULT_CATEGORIES))
