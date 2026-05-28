@@ -753,7 +753,7 @@ def pip_install(packages: Sequence[str]) -> None:
 def ensure_dependencies(skip_install: bool) -> None:
     if skip_install:
         return
-    pip_install(["objaverse", "tqdm", "kaggle"])
+    pip_install(["objaverse", "tqdm", "kaggle", "trimesh", "Pillow"])
 
 
 def blender_release_url(version: str) -> str:
@@ -894,6 +894,18 @@ def append_csv(src: Path, dst: Path) -> None:
             writer.writerow(row)
 
 
+def write_rows_csv(path: Path, rows: Sequence[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def batched(items: Sequence[str], size: int) -> Iterable[List[str]]:
     for i in range(0, len(items), size):
         yield list(items[i : i + size])
@@ -972,6 +984,244 @@ def count_rows(csv_path: Path) -> int:
         return 0
     with open(csv_path, "r", encoding="utf-8", newline="") as f:
         return max(sum(1 for _ in f) - 1, 0)
+
+
+def python_load_mesh(path: str):
+    import trimesh
+
+    loaded = trimesh.load(path, force="scene", process=False)
+    meshes = []
+    if isinstance(loaded, trimesh.Scene):
+        dumped = loaded.dump(concatenate=False)
+        if isinstance(dumped, trimesh.Trimesh):
+            meshes.append(dumped.copy())
+        else:
+            for geom in dumped:
+                if isinstance(geom, trimesh.Trimesh) and len(geom.vertices) and len(geom.faces):
+                    meshes.append(geom.copy())
+    elif isinstance(loaded, trimesh.Trimesh):
+        meshes.append(loaded.copy())
+    if not meshes:
+        raise RuntimeError("No mesh geometry loaded by trimesh")
+    mesh = trimesh.util.concatenate(meshes)
+    mesh.remove_unreferenced_vertices()
+    if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+        raise RuntimeError("Loaded mesh is empty")
+    return mesh
+
+
+def python_normalize_mesh(mesh):
+    import numpy as np
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    lo = vertices.min(axis=0)
+    hi = vertices.max(axis=0)
+    dims = hi - lo
+    max_dim = float(dims.max())
+    if not np.isfinite(max_dim) or max_dim <= 1e-9:
+        raise RuntimeError(f"Degenerate mesh bounds: {dims.tolist()}")
+    center = (lo + hi) * 0.5
+    vertices = (vertices - center) * (1.8 / max_dim)
+    vertices[:, 2] -= vertices[:, 2].min()
+    mesh.vertices = vertices
+    lo = vertices.min(axis=0)
+    hi = vertices.max(axis=0)
+    dims = hi - lo
+    center = (lo + hi) * 0.5
+    return {
+        "bbox_min": [float(v) for v in lo],
+        "bbox_max": [float(v) for v in hi],
+        "bbox_dims": [float(v) for v in dims],
+        "bbox_center": [float(v) for v in center],
+    }
+
+
+def python_sample_surface(mesh, count: int):
+    import numpy as np
+    import trimesh
+
+    points, face_index = trimesh.sample.sample_surface(mesh, count)
+    normals = np.asarray(mesh.face_normals[face_index], dtype=np.float32)
+    return np.asarray(points, dtype=np.float32), normals
+
+
+def python_camera_matrix(location, target):
+    import numpy as np
+
+    location = np.asarray(location, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    forward = target - location
+    forward /= max(np.linalg.norm(forward), 1e-12)
+    right = np.cross(forward, np.array([0.0, 0.0, 1.0]))
+    if np.linalg.norm(right) < 1e-8:
+        right = np.array([1.0, 0.0, 0.0])
+    right /= max(np.linalg.norm(right), 1e-12)
+    up = np.cross(right, forward)
+    up /= max(np.linalg.norm(up), 1e-12)
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, 0] = right
+    matrix[:3, 1] = up
+    matrix[:3, 2] = -forward
+    matrix[:3, 3] = location
+    return matrix
+
+
+def python_render_points(path: Path, points, normals, camera_matrix, ortho_scale: float, resolution: int):
+    import numpy as np
+    from PIL import Image
+
+    inv = np.linalg.inv(camera_matrix)
+    homog = np.concatenate([points.astype(np.float64), np.ones((len(points), 1), dtype=np.float64)], axis=1)
+    cam = (inv @ homog.T).T[:, :3]
+    rot = inv[:3, :3]
+    cam_normals = (rot @ normals.astype(np.float64).T).T
+
+    x = ((cam[:, 0] / ortho_scale) + 0.5) * resolution
+    y = (0.5 - (cam[:, 1] / ortho_scale)) * resolution
+    depth = -cam[:, 2]
+    valid = (x >= -4) & (x < resolution + 4) & (y >= -4) & (y < resolution + 4)
+    if not np.any(valid):
+        raise RuntimeError("No projected points in frame")
+
+    x = np.clip(x[valid].astype(np.int32), 0, resolution - 1)
+    y = np.clip(y[valid].astype(np.int32), 0, resolution - 1)
+    depth = depth[valid]
+    cam_normals = cam_normals[valid]
+    order = np.argsort(depth)[::-1]
+
+    rgb = np.zeros((resolution, resolution, 3), dtype=np.float32)
+    rgb[:, :, :] = np.array([0.78, 0.80, 0.82], dtype=np.float32)
+    zbuf = np.full((resolution, resolution), np.inf, dtype=np.float64)
+    light = np.array([0.25, -0.35, 0.9], dtype=np.float64)
+    light /= np.linalg.norm(light)
+    base = np.array([0.84, 0.78, 0.66], dtype=np.float32)
+    radius = max(1, resolution // 128)
+
+    for idx in order:
+        px = int(x[idx])
+        py = int(y[idx])
+        z = float(depth[idx])
+        normal = cam_normals[idx]
+        normal_norm = np.linalg.norm(normal)
+        if normal_norm > 1e-9:
+            normal = normal / normal_norm
+        shade = 0.62 + 0.38 * max(0.0, float(np.dot(normal, light)))
+        color = np.clip(base * shade, 0.0, 1.0)
+        for yy in range(max(0, py - radius), min(resolution, py + radius + 1)):
+            for xx in range(max(0, px - radius), min(resolution, px + radius + 1)):
+                if z < zbuf[yy, xx]:
+                    zbuf[yy, xx] = z
+                    rgb[yy, xx, :] = color
+
+    max_rgb = float(rgb.max())
+    if max_rgb < 0.05:
+        raise RuntimeError(f"Software renderer produced a black image: max_rgb={max_rgb}")
+    img = Image.fromarray(np.clip(rgb * 255.0, 0, 255).astype(np.uint8), mode="RGB")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(path)
+    return {"mean_rgb": float(rgb.mean()), "max_rgb": max_rgb, "mean_alpha": 1.0}
+
+
+def python_process_one(entry: dict, output_dir: Path, args: argparse.Namespace, index: int):
+    import numpy as np
+
+    uid = entry["uid"]
+    source_path = entry["path"]
+    random.seed(args.seed + index)
+    np.random.seed(args.seed + index)
+
+    mesh = python_load_mesh(source_path)
+    faces = int(len(mesh.faces))
+    if faces < args.min_faces:
+        raise RuntimeError(f"Too few faces: {faces}")
+    if faces > args.max_faces:
+        raise RuntimeError(f"Too many faces: {faces}")
+
+    bbox = python_normalize_mesh(mesh)
+    object_dir = output_dir / "objects" / uid
+    object_dir.mkdir(parents=True, exist_ok=True)
+    normalized_path = object_dir / "normalized.glb"
+    mesh.export(normalized_path)
+
+    points, normals = python_sample_surface(mesh, args.points)
+    points_path = object_dir / "points.npz"
+    np.savez_compressed(points_path, points=points, normals=normals)
+
+    render_dir = output_dir / "renders" / uid
+    target = np.asarray(bbox["bbox_center"], dtype=np.float64)
+    max_dim = max(float(v) for v in bbox["bbox_dims"])
+    ortho_scale = max(2.20, max_dim * 1.35)
+    rng = random.Random(args.seed + index)
+    start_azimuth = rng.uniform(0.0, 360.0)
+    rows = []
+    for view_idx in range(args.views):
+        azimuth = start_azimuth + view_idx * (360.0 / args.views)
+        elevation = rng.uniform(args.elevation_min, args.elevation_max)
+        az = math.radians(azimuth)
+        el = math.radians(elevation)
+        radius = float(args.camera_radius)
+        location = target + np.array([
+            radius * math.cos(el) * math.cos(az),
+            radius * math.cos(el) * math.sin(az),
+            radius * math.sin(el),
+        ])
+        camera_matrix = python_camera_matrix(location, target)
+        image_path = render_dir / f"view_{view_idx:03d}.png"
+        stats = python_render_points(image_path, points, normals, camera_matrix, ortho_scale, args.resolution)
+        focal_like = args.resolution / ortho_scale
+        rows.append({
+            "uid": uid,
+            "view_index": view_idx,
+            "image_path": str(image_path),
+            "azimuth_deg": float(azimuth % 360.0),
+            "elevation_deg": float(elevation),
+            "radius": radius,
+            "camera_location": [float(v) for v in location],
+            "camera_matrix_world": [[float(v) for v in row] for row in camera_matrix],
+            "camera_intrinsics": [[focal_like, 0.0, args.resolution / 2.0], [0.0, focal_like, args.resolution / 2.0], [0.0, 0.0, 1.0]],
+            "camera_type": "ORTHO",
+            "ortho_scale": float(ortho_scale),
+            "render_mean_rgb": stats["mean_rgb"],
+            "render_max_rgb": stats["max_rgb"],
+            "render_mean_alpha": stats["mean_alpha"],
+        })
+
+    object_row = {
+        "uid": uid,
+        "source_path": source_path,
+        "normalized_glb": str(normalized_path),
+        "points_npz": str(points_path),
+        "face_count": faces,
+        **bbox,
+    }
+    return object_row, rows
+
+
+def python_process_chunk(entries: Sequence[dict], output_dir: Path, args: argparse.Namespace) -> None:
+    metadata_dir = output_dir / "metadata"
+    object_rows = []
+    view_rows = []
+    failed_rows = []
+    for index, entry in enumerate(entries):
+        uid = entry["uid"]
+        print(f"[python] Processing {index + 1}/{len(entries)} {uid}", flush=True)
+        try:
+            object_row, rows = python_process_one(entry, output_dir, args, index)
+            object_rows.append(object_row)
+            view_rows.extend(rows)
+        except Exception as exc:
+            failed_rows.append({
+                "uid": uid,
+                "source_path": entry.get("path", ""),
+                "error": str(exc),
+                "traceback": repr(exc),
+            })
+            print(f"[python] FAILED {uid}: {exc}", flush=True)
+
+    write_rows_csv(metadata_dir / "objects_chunk.csv", object_rows)
+    write_rows_csv(metadata_dir / "views_chunk.csv", view_rows)
+    write_rows_csv(metadata_dir / "failed_chunk.csv", failed_rows)
+    print(f"[python] Chunk complete: accepted={len(object_rows)} failed={len(failed_rows)} views={len(view_rows)}", flush=True)
 
 
 def write_dataset_info(args: argparse.Namespace, output_dir: Path, accepted: int) -> None:
@@ -1165,13 +1415,16 @@ def build_dataset(args: argparse.Namespace) -> None:
     metadata_dir = output_dir / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
     write_kaggle_dataset_metadata(args, output_dir)
-    worker_path = write_blender_worker(output_dir)
-    blender = ensure_blender(
-        Path(args.blender_dir),
-        args.blender_version,
-        args.skip_blender_download,
-        args.skip_apt_blender,
-    )
+    worker_path = None
+    blender = None
+    if args.renderer == "blender":
+        worker_path = write_blender_worker(output_dir)
+        blender = ensure_blender(
+            Path(args.blender_dir),
+            args.blender_version,
+            args.skip_blender_download,
+            args.skip_apt_blender,
+        )
 
     categories = normalize_categories(args.categories)
     max_candidates = args.max_candidates if args.max_candidates > 0 else None
@@ -1232,64 +1485,68 @@ def build_dataset(args: argparse.Namespace) -> None:
         if not entries:
             continue
 
-        entries = entries[:remaining]
-        manifest = output_dir / "_scripts" / "chunk_manifest.json"
-        manifest.write_text(json.dumps(entries, ensure_ascii=True, indent=2), encoding="utf-8")
+        # Process extra candidates when only a few more accepted objects are needed,
+        # because some Objaverse assets are malformed or fail geometry filters.
+        process_limit = min(len(entries), max(remaining, min(args.download_batch, remaining * 3 + 6)))
+        entries = entries[:process_limit]
+        if args.renderer == "python":
+            python_process_chunk(entries, output_dir, args)
+        else:
+            manifest = output_dir / "_scripts" / "chunk_manifest.json"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(json.dumps(entries, ensure_ascii=True, indent=2), encoding="utf-8")
 
-        env = os.environ.copy()
-        env.setdefault("CUDA_VISIBLE_DEVICES", "0")
-        env.update(
-            {
-                "OBJAVERSE_WORKER_MANIFEST": str(manifest),
-                "OBJAVERSE_WORKER_OUTPUT_DIR": str(output_dir),
-                "OBJAVERSE_WORKER_VIEWS": str(args.views),
-                "OBJAVERSE_WORKER_RESOLUTION": str(args.resolution),
-                "OBJAVERSE_WORKER_POINTS": str(args.points),
-                "OBJAVERSE_WORKER_SEED": str(args.seed),
-                "OBJAVERSE_WORKER_MIN_FACES": str(args.min_faces),
-                "OBJAVERSE_WORKER_MAX_FACES": str(args.max_faces),
-                "OBJAVERSE_WORKER_CAMERA_RADIUS": str(args.camera_radius),
-                "OBJAVERSE_WORKER_ELEVATION_MIN": str(args.elevation_min),
-                "OBJAVERSE_WORKER_ELEVATION_MAX": str(args.elevation_max),
-                "OBJAVERSE_WORKER_USE_GPU": "1" if args.use_gpu else "0",
-            }
-        )
-        cmd = [
-            str(blender),
-            "--background",
-            "--factory-startup",
-            "--python",
-            str(worker_path),
-            "--",
-            "--manifest",
-            str(manifest),
-            "--output-dir",
-            str(output_dir),
-            "--views",
-            str(args.views),
-            "--resolution",
-            str(args.resolution),
-            "--points",
-            str(args.points),
-            "--seed",
-            str(args.seed),
-            "--min-faces",
-            str(args.min_faces),
-            "--max-faces",
-            str(args.max_faces),
-            "--camera-radius",
-            str(args.camera_radius),
-            "--elevation-min",
-            str(args.elevation_min),
-            "--elevation-max",
-            str(args.elevation_max),
-        ]
-        if args.use_gpu:
-            cmd.append("--use-gpu")
-
-        # The worker writes chunk CSVs into metadata/. Move them through a stable
-        # temporary location before appending, so reruns remain resumable.
-        run(cmd, env=env)
+            env = os.environ.copy()
+            env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+            env.update(
+                {
+                    "OBJAVERSE_WORKER_MANIFEST": str(manifest),
+                    "OBJAVERSE_WORKER_OUTPUT_DIR": str(output_dir),
+                    "OBJAVERSE_WORKER_VIEWS": str(args.views),
+                    "OBJAVERSE_WORKER_RESOLUTION": str(args.resolution),
+                    "OBJAVERSE_WORKER_POINTS": str(args.points),
+                    "OBJAVERSE_WORKER_SEED": str(args.seed),
+                    "OBJAVERSE_WORKER_MIN_FACES": str(args.min_faces),
+                    "OBJAVERSE_WORKER_MAX_FACES": str(args.max_faces),
+                    "OBJAVERSE_WORKER_CAMERA_RADIUS": str(args.camera_radius),
+                    "OBJAVERSE_WORKER_ELEVATION_MIN": str(args.elevation_min),
+                    "OBJAVERSE_WORKER_ELEVATION_MAX": str(args.elevation_max),
+                    "OBJAVERSE_WORKER_USE_GPU": "1" if args.use_gpu else "0",
+                }
+            )
+            cmd = [
+                str(blender),
+                "--background",
+                "--factory-startup",
+                "--python",
+                str(worker_path),
+                "--",
+                "--manifest",
+                str(manifest),
+                "--output-dir",
+                str(output_dir),
+                "--views",
+                str(args.views),
+                "--resolution",
+                str(args.resolution),
+                "--points",
+                str(args.points),
+                "--seed",
+                str(args.seed),
+                "--min-faces",
+                str(args.min_faces),
+                "--max-faces",
+                str(args.max_faces),
+                "--camera-radius",
+                str(args.camera_radius),
+                "--elevation-min",
+                str(args.elevation_min),
+                "--elevation-max",
+                str(args.elevation_max),
+            ]
+            if args.use_gpu:
+                cmd.append("--use-gpu")
+            run(cmd, env=env)
         chunk_outputs = [
             metadata_dir / "objects_chunk.csv",
             metadata_dir / "views_chunk.csv",
@@ -1371,6 +1628,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--views", type=int, default=12)
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--points", type=int, default=32768)
+    parser.add_argument(
+        "--renderer",
+        choices=("python", "blender"),
+        default="python",
+        help="Use python for a Blender-free trimesh renderer, or blender for the legacy Blender worker.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--categories", default=",".join(DEFAULT_CATEGORIES))
     parser.add_argument(
