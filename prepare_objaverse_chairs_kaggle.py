@@ -173,8 +173,9 @@ def clean_scene():
 def configure_render(resolution, use_gpu):
     scene = bpy.context.scene
     scene.render.engine = "CYCLES"
-    scene.cycles.samples = 64
+    scene.cycles.samples = 48
     scene.cycles.use_denoising = True
+    scene.cycles.device = "CPU"
     scene.render.resolution_x = resolution
     scene.render.resolution_y = resolution
     scene.render.film_transparent = False
@@ -216,18 +217,26 @@ def configure_render(resolution, use_gpu):
         print("[blender] GPU unavailable, falling back to CPU", flush=True)
 
 
+def force_cpu_rendering():
+    scene = bpy.context.scene
+    scene.render.engine = "CYCLES"
+    scene.cycles.device = "CPU"
+    scene.cycles.samples = 48
+    scene.render.film_transparent = False
+
+
 def apply_clay_material():
     material = bpy.data.materials.new("dataset_visible_warm_gray")
-    material.diffuse_color = (0.72, 0.70, 0.66, 1.0)
+    material.diffuse_color = (0.82, 0.80, 0.74, 1.0)
     material.use_nodes = True
-    bsdf = material.node_tree.nodes.get("Principled BSDF")
-    if bsdf:
-        if "Base Color" in bsdf.inputs:
-            bsdf.inputs["Base Color"].default_value = (0.72, 0.70, 0.66, 1.0)
-        if "Roughness" in bsdf.inputs:
-            bsdf.inputs["Roughness"].default_value = 0.82
-        if "Specular" in bsdf.inputs:
-            bsdf.inputs["Specular"].default_value = 0.18
+    nodes = material.node_tree.nodes
+    for node in list(nodes):
+        nodes.remove(node)
+    output = nodes.new(type="ShaderNodeOutputMaterial")
+    emission = nodes.new(type="ShaderNodeEmission")
+    emission.inputs["Color"].default_value = (0.82, 0.80, 0.74, 1.0)
+    emission.inputs["Strength"].default_value = 1.0
+    material.node_tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
     for obj in mesh_objects():
         obj.data.materials.clear()
         obj.data.materials.append(material)
@@ -379,6 +388,40 @@ def camera_intrinsics(camera, resolution):
     return [[focal_px, 0.0, cx], [0.0, focal_px, cy], [0.0, 0.0, 1.0]]
 
 
+def rendered_image_stats(path):
+    image = bpy.data.images.load(str(path), check_existing=False)
+    try:
+        pixels = list(image.pixels)
+        if not pixels:
+            return {"mean_rgb": 0.0, "max_rgb": 0.0, "mean_alpha": 0.0}
+        rgb_values = []
+        alpha_values = []
+        for i in range(0, len(pixels), 4):
+            rgb_values.extend((pixels[i], pixels[i + 1], pixels[i + 2]))
+            alpha_values.append(pixels[i + 3])
+        return {
+            "mean_rgb": float(sum(rgb_values) / max(len(rgb_values), 1)),
+            "max_rgb": float(max(rgb_values) if rgb_values else 0.0),
+            "mean_alpha": float(sum(alpha_values) / max(len(alpha_values), 1)),
+        }
+    finally:
+        bpy.data.images.remove(image)
+
+
+def render_still_checked(path):
+    bpy.context.scene.render.filepath = str(path)
+    bpy.ops.render.render(write_still=True)
+    stats = rendered_image_stats(path)
+    if stats["max_rgb"] < 0.05:
+        print(f"[blender] Render was nearly black, retrying on CPU: {stats}", flush=True)
+        force_cpu_rendering()
+        bpy.ops.render.render(write_still=True)
+        stats = rendered_image_stats(path)
+    if stats["max_rgb"] < 0.05:
+        raise RuntimeError(f"Rendered image is still nearly black after CPU retry: {stats}")
+    return stats
+
+
 def export_normalized_glb(path):
     bpy.ops.object.select_all(action="DESELECT")
     for obj in mesh_objects():
@@ -482,8 +525,7 @@ def render_views(uid, out_dir, views, resolution, radius, elevation_min, elevati
         look_at(camera, target)
 
         png_path = render_dir / f"view_{view_idx:03d}.png"
-        bpy.context.scene.render.filepath = str(png_path)
-        bpy.ops.render.render(write_still=True)
+        render_stats = render_still_checked(png_path)
 
         view_rows.append({
             "uid": uid,
@@ -497,6 +539,9 @@ def render_views(uid, out_dir, views, resolution, radius, elevation_min, elevati
             "camera_intrinsics": camera_intrinsics(camera, resolution),
             "camera_type": camera.data.type,
             "ortho_scale": float(camera.data.ortho_scale),
+            "render_mean_rgb": render_stats["mean_rgb"],
+            "render_max_rgb": render_stats["max_rgb"],
+            "render_mean_alpha": render_stats["mean_alpha"],
         })
     return view_rows
 
@@ -1253,7 +1298,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera_radius", type=float, default=3.0)
     parser.add_argument("--elevation_min", type=float, default=10.0)
     parser.add_argument("--elevation_max", type=float, default=30.0)
-    parser.add_argument("--use_gpu", action="store_true", default=True)
+    parser.add_argument("--use_gpu", action="store_true", default=False)
     parser.add_argument("--no_gpu", action="store_false", dest="use_gpu")
     parser.add_argument("--keep_raw", action="store_true")
     parser.add_argument(
