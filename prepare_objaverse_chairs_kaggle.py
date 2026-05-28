@@ -172,26 +172,38 @@ def clean_scene():
 
 def configure_render(resolution, use_gpu):
     scene = bpy.context.scene
-    scene.render.engine = "CYCLES"
-    scene.cycles.samples = 64
-    scene.cycles.use_denoising = True
+    try:
+        scene.render.engine = "BLENDER_EEVEE"
+    except Exception:
+        scene.render.engine = "BLENDER_RENDER"
     scene.render.resolution_x = resolution
     scene.render.resolution_y = resolution
-    scene.render.film_transparent = True
+    scene.render.film_transparent = False
     try:
-        scene.view_settings.view_transform = "Filmic"
-    except Exception:
         scene.view_settings.view_transform = "Standard"
+    except Exception:
+        pass
     try:
-        scene.view_settings.look = "Medium High Contrast"
+        scene.view_settings.look = "None"
+    except Exception:
+        pass
+    try:
+        scene.view_settings.exposure = 0.0
+        scene.view_settings.gamma = 1.0
     except Exception:
         pass
     scene.render.image_settings.file_format = IMAGE_FORMAT
     scene.render.image_settings.color_mode = "RGBA"
     scene.world = bpy.data.worlds.new("World") if scene.world is None else scene.world
-    scene.world.color = (1.0, 1.0, 1.0)
+    scene.world.color = (0.78, 0.80, 0.82)
 
-    if use_gpu:
+    if hasattr(scene, "eevee"):
+        scene.eevee.use_gtao = True
+        scene.eevee.gtao_distance = 3
+        scene.eevee.gtao_factor = 1.25
+        scene.eevee.taa_render_samples = 64
+
+    if scene.render.engine == "CYCLES" and use_gpu:
         prefs = bpy.context.preferences.addons["cycles"].preferences
         enabled = False
         for compute_type in ("OPTIX", "CUDA", "HIP", "METAL", "ONEAPI"):
@@ -209,6 +221,23 @@ def configure_render(resolution, use_gpu):
             except Exception:
                 pass
         print("[blender] GPU unavailable, falling back to CPU", flush=True)
+
+
+def apply_clay_material():
+    material = bpy.data.materials.new("dataset_visible_warm_gray")
+    material.diffuse_color = (0.72, 0.70, 0.66, 1.0)
+    material.use_nodes = True
+    bsdf = material.node_tree.nodes.get("Principled BSDF")
+    if bsdf:
+        if "Base Color" in bsdf.inputs:
+            bsdf.inputs["Base Color"].default_value = (0.72, 0.70, 0.66, 1.0)
+        if "Roughness" in bsdf.inputs:
+            bsdf.inputs["Roughness"].default_value = 0.82
+        if "Specular" in bsdf.inputs:
+            bsdf.inputs["Specular"].default_value = 0.18
+    for obj in mesh_objects():
+        obj.data.materials.clear()
+        obj.data.materials.append(material)
 
 
 def import_object(path):
@@ -303,24 +332,34 @@ def normalize_scene():
 
 
 def add_lights():
-    bpy.ops.object.light_add(type="AREA", location=(0.0, -3.5, 5.0))
+    bpy.ops.object.light_add(type="AREA", location=(0.0, -4.0, 5.0))
     key = bpy.context.object
     key.name = "Key_Area_Light"
-    key.data.energy = 500
-    key.data.size = 5.0
+    key.data.energy = 700
+    key.data.size = 4.5
 
-    bpy.ops.object.light_add(type="POINT", location=(-3.0, 2.5, 3.0))
+    bpy.ops.object.light_add(type="AREA", location=(-3.5, 3.0, 3.5))
     fill = bpy.context.object
     fill.name = "Fill_Light"
-    fill.data.energy = 80
+    fill.data.energy = 180
+    fill.data.size = 5.5
+
+    bpy.ops.object.light_add(type="AREA", location=(3.0, 4.0, 5.0))
+    rim = bpy.context.object
+    rim.name = "Rim_Light"
+    rim.data.energy = 130
+    rim.data.size = 4.0
 
 
 def make_camera():
     bpy.ops.object.camera_add()
     camera = bpy.context.object
     camera.name = "Camera"
-    camera.data.lens = 55
+    camera.data.type = "ORTHO"
+    camera.data.ortho_scale = 2.35
+    camera.data.lens = 70
     camera.data.sensor_width = 32
+    camera.data.clip_end = 100
     bpy.context.scene.camera = camera
     return camera
 
@@ -335,6 +374,10 @@ def matrix_to_list(matrix):
 
 
 def camera_intrinsics(camera, resolution):
+    if camera.data.type == "ORTHO":
+        scale = float(camera.data.ortho_scale)
+        focal_like = resolution / scale
+        return [[focal_like, 0.0, resolution / 2.0], [0.0, focal_like, resolution / 2.0], [0.0, 0.0, 1.0]]
     lens = camera.data.lens
     sensor_width = camera.data.sensor_width
     focal_px = lens * resolution / sensor_width
@@ -420,11 +463,15 @@ def sample_surface_points(count):
     return points.astype(np.float32), normals_chosen.astype(np.float32)
 
 
-def render_views(uid, out_dir, views, resolution, radius, elevation_min, elevation_max, seed):
+def render_views(uid, out_dir, views, resolution, radius, elevation_min, elevation_max, seed, bbox):
     render_dir = out_dir / "renders" / uid
     render_dir.mkdir(parents=True, exist_ok=True)
     camera = make_camera()
     add_lights()
+    target = mathutils.Vector(bbox["bbox_center"])
+    dims = bbox["bbox_dims"]
+    max_dim = max(float(dims[0]), float(dims[1]), float(dims[2]))
+    camera.data.ortho_scale = max(2.20, max_dim * 1.35)
 
     rng = random.Random(seed)
     # One clean orbit plus slight deterministic elevation variation.
@@ -435,11 +482,11 @@ def render_views(uid, out_dir, views, resolution, radius, elevation_min, elevati
         elevation = rng.uniform(elevation_min, elevation_max)
         az = math.radians(azimuth)
         el = math.radians(elevation)
-        x = radius * math.cos(el) * math.cos(az)
-        y = radius * math.cos(el) * math.sin(az)
-        z = radius * math.sin(el) + 0.75
+        x = target.x + radius * math.cos(el) * math.cos(az)
+        y = target.y + radius * math.cos(el) * math.sin(az)
+        z = target.z + radius * math.sin(el)
         camera.location = (x, y, z)
-        look_at(camera, (0.0, 0.0, 0.75))
+        look_at(camera, target)
 
         png_path = render_dir / f"view_{view_idx:03d}.png"
         bpy.context.scene.render.filepath = str(png_path)
@@ -455,6 +502,8 @@ def render_views(uid, out_dir, views, resolution, radius, elevation_min, elevati
             "camera_location": [float(v) for v in camera.location],
             "camera_matrix_world": matrix_to_list(camera.matrix_world),
             "camera_intrinsics": camera_intrinsics(camera, resolution),
+            "camera_type": camera.data.type,
+            "ortho_scale": float(camera.data.ortho_scale),
         })
     return view_rows
 
@@ -479,6 +528,7 @@ def process_one(entry, out_dir, args, index):
         raise RuntimeError(f"Too many faces: {faces}")
 
     bbox = normalize_scene()
+    apply_clay_material()
     object_dir = out_dir / "objects" / uid
     object_dir.mkdir(parents=True, exist_ok=True)
     export_normalized_glb(object_dir / "normalized.glb")
@@ -494,6 +544,7 @@ def process_one(entry, out_dir, args, index):
         elevation_min=args.elevation_min,
         elevation_max=args.elevation_max,
         seed=args.seed + index,
+        bbox=bbox,
     )
     return {
         "uid": uid,
@@ -980,6 +1031,14 @@ def build_dataset(args: argparse.Namespace) -> None:
     ensure_dependencies(args.skip_install)
 
     output_dir = Path(args.output_dir)
+    if args.clean_output and output_dir.exists():
+        resolved = output_dir.resolve()
+        allowed_roots = [Path("/kaggle/working").resolve(), Path("/tmp").resolve()]
+        if not any(str(resolved).startswith(str(root)) for root in allowed_roots):
+            raise RuntimeError(f"Refusing to clean output directory outside Kaggle working/tmp: {resolved}")
+        print(f"Cleaning existing output directory: {output_dir}", flush=True)
+        shutil.rmtree(output_dir)
+
     metadata_dir = output_dir / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
     write_kaggle_dataset_metadata(args, output_dir)
@@ -1253,6 +1312,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip_install", action="store_true")
     parser.add_argument("--skip_blender_download", action="store_true")
+    parser.add_argument(
+        "--clean_output",
+        action="store_true",
+        help="Delete the existing output_dir before processing. Use this after changing render settings.",
+    )
     parser.add_argument(
         "--skip_apt_blender",
         action="store_true",
