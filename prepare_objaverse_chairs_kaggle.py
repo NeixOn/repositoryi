@@ -498,13 +498,13 @@ def run(cmd: Sequence[str], *, check: bool = True, env: Dict[str, str] | None = 
 
 
 def pip_install(packages: Sequence[str]) -> None:
-    run([sys.executable, "-m", "pip", "install", "-q", "--upgrade", *packages])
+    run([sys.executable, "-m", "pip", "install", "-q", *packages])
 
 
 def ensure_dependencies(skip_install: bool) -> None:
     if skip_install:
         return
-    pip_install(["objaverse", "numpy", "pandas", "tqdm", "Pillow", "kaggle"])
+    pip_install(["objaverse", "tqdm", "kaggle"])
 
 
 def blender_release_url(version: str) -> str:
@@ -534,10 +534,36 @@ def safe_extract_tar(archive: tarfile.TarFile, dst: Path) -> None:
     archive.extractall(dst)
 
 
+def try_install_blender_with_apt() -> Path | None:
+    if os.name != "posix" or not shutil.which("apt-get"):
+        return None
+    print("Blender executable was not found. Trying apt-get install blender...", flush=True)
+    commands = [
+        ["apt-get", "update", "-qq"],
+        ["apt-get", "install", "-y", "-qq", "blender"],
+    ]
+    for cmd in commands:
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            print(f"apt-get command failed: {' '.join(cmd)}", flush=True)
+            return None
+    blender = shutil.which("blender")
+    if blender:
+        return Path(blender)
+    return None
+
+
 def download_with_progress(url: str, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading Blender from {url}", flush=True)
-    with urllib.request.urlopen(url) as response, open(dst, "wb") as f:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 Kaggle Objaverse Dataset Builder",
+            "Accept": "application/octet-stream,*/*",
+        },
+    )
+    with urllib.request.urlopen(request) as response, open(dst, "wb") as f:
         total = int(response.headers.get("Content-Length", "0") or "0")
         downloaded = 0
         last_print = time.time()
@@ -555,17 +581,30 @@ def download_with_progress(url: str, dst: Path) -> None:
                 last_print = time.time()
 
 
-def ensure_blender(blender_dir: Path, version: str, skip_download: bool) -> Path:
+def ensure_blender(blender_dir: Path, version: str, skip_download: bool, skip_apt: bool) -> Path:
     blender = find_blender(blender_dir)
     if blender:
         print(f"Using Blender: {blender}", flush=True)
         return blender
+
+    if not skip_apt:
+        blender = try_install_blender_with_apt()
+        if blender:
+            print(f"Using Blender installed by apt: {blender}", flush=True)
+            return blender
+
     if skip_download:
         raise RuntimeError("Blender was not found and --skip_blender_download was set.")
 
     archive = blender_dir / f"blender-{version}-linux-x64.tar.xz"
     if not archive.exists():
-        download_with_progress(blender_release_url(version), archive)
+        try:
+            download_with_progress(blender_release_url(version), archive)
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not install Blender. apt-get did not provide Blender and the direct Blender download failed. "
+                "In Kaggle, try adding a Blender binary as an input dataset or run with internet enabled."
+            ) from exc
     print(f"Extracting {archive}", flush=True)
     blender_dir.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:xz") as tar:
@@ -840,7 +879,12 @@ def build_dataset(args: argparse.Namespace) -> None:
     metadata_dir.mkdir(parents=True, exist_ok=True)
     write_kaggle_dataset_metadata(args, output_dir)
     worker_path = write_blender_worker(output_dir)
-    blender = ensure_blender(Path(args.blender_dir), args.blender_version, args.skip_blender_download)
+    blender = ensure_blender(
+        Path(args.blender_dir),
+        args.blender_version,
+        args.skip_blender_download,
+        args.skip_apt_blender,
+    )
 
     categories = normalize_categories(args.categories)
     max_candidates = args.max_candidates if args.max_candidates > 0 else None
@@ -1079,6 +1123,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip_install", action="store_true")
     parser.add_argument("--skip_blender_download", action="store_true")
+    parser.add_argument(
+        "--skip_apt_blender",
+        action="store_true",
+        help="Do not try installing Blender with apt-get before falling back to direct download.",
+    )
     return parser.parse_args()
 
 
