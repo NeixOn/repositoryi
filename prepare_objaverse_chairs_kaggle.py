@@ -172,10 +172,9 @@ def clean_scene():
 
 def configure_render(resolution, use_gpu):
     scene = bpy.context.scene
-    try:
-        scene.render.engine = "BLENDER_EEVEE"
-    except Exception:
-        scene.render.engine = "BLENDER_RENDER"
+    scene.render.engine = "CYCLES"
+    scene.cycles.samples = 64
+    scene.cycles.use_denoising = True
     scene.render.resolution_x = resolution
     scene.render.resolution_y = resolution
     scene.render.film_transparent = False
@@ -197,13 +196,7 @@ def configure_render(resolution, use_gpu):
     scene.world = bpy.data.worlds.new("World") if scene.world is None else scene.world
     scene.world.color = (0.78, 0.80, 0.82)
 
-    if hasattr(scene, "eevee"):
-        scene.eevee.use_gtao = True
-        scene.eevee.gtao_distance = 3
-        scene.eevee.gtao_factor = 1.25
-        scene.eevee.taa_render_samples = 64
-
-    if scene.render.engine == "CYCLES" and use_gpu:
+    if use_gpu:
         prefs = bpy.context.preferences.addons["cycles"].preferences
         enabled = False
         for compute_type in ("OPTIX", "CUDA", "HIP", "METAL", "ONEAPI"):
