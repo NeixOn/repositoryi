@@ -85,26 +85,75 @@ import numpy as np
 IMAGE_FORMAT = "PNG"
 
 
+def env_int(name):
+    value = os.environ.get(name)
+    return int(value) if value not in (None, "") else None
+
+
+def env_float(name):
+    value = os.environ.get(name)
+    return float(value) if value not in (None, "") else None
+
+
 def parse_args():
     argv = sys.argv
     if "--" in argv:
         argv = argv[argv.index("--") + 1:]
+    elif "--manifest" in argv:
+        argv = argv[argv.index("--manifest"):]
     else:
-        argv = []
+        # Some older Blender builds do not preserve the separator in sys.argv.
+        # Keep only our worker flags if Blender passed them through differently.
+        known = {
+            "--manifest",
+            "--output-dir",
+            "--views",
+            "--resolution",
+            "--points",
+            "--seed",
+            "--min-faces",
+            "--max-faces",
+            "--camera-radius",
+            "--elevation-min",
+            "--elevation-max",
+            "--use-gpu",
+        }
+        first = next((i for i, item in enumerate(argv) if item in known), None)
+        argv = argv[first:] if first is not None else []
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--views", type=int, required=True)
-    parser.add_argument("--resolution", type=int, required=True)
-    parser.add_argument("--points", type=int, required=True)
-    parser.add_argument("--seed", type=int, required=True)
-    parser.add_argument("--min-faces", type=int, required=True)
-    parser.add_argument("--max-faces", type=int, required=True)
-    parser.add_argument("--camera-radius", type=float, required=True)
-    parser.add_argument("--elevation-min", type=float, required=True)
-    parser.add_argument("--elevation-max", type=float, required=True)
-    parser.add_argument("--use-gpu", action="store_true")
-    return parser.parse_args()
+    parser.add_argument("--manifest", default=os.environ.get("OBJAVERSE_WORKER_MANIFEST"))
+    parser.add_argument("--output-dir", default=os.environ.get("OBJAVERSE_WORKER_OUTPUT_DIR"))
+    parser.add_argument("--views", type=int, default=env_int("OBJAVERSE_WORKER_VIEWS"))
+    parser.add_argument("--resolution", type=int, default=env_int("OBJAVERSE_WORKER_RESOLUTION"))
+    parser.add_argument("--points", type=int, default=env_int("OBJAVERSE_WORKER_POINTS"))
+    parser.add_argument("--seed", type=int, default=env_int("OBJAVERSE_WORKER_SEED"))
+    parser.add_argument("--min-faces", type=int, default=env_int("OBJAVERSE_WORKER_MIN_FACES"))
+    parser.add_argument("--max-faces", type=int, default=env_int("OBJAVERSE_WORKER_MAX_FACES"))
+    parser.add_argument("--camera-radius", type=float, default=env_float("OBJAVERSE_WORKER_CAMERA_RADIUS"))
+    parser.add_argument("--elevation-min", type=float, default=env_float("OBJAVERSE_WORKER_ELEVATION_MIN"))
+    parser.add_argument("--elevation-max", type=float, default=env_float("OBJAVERSE_WORKER_ELEVATION_MAX"))
+    parser.add_argument("--use-gpu", action="store_true", default=os.environ.get("OBJAVERSE_WORKER_USE_GPU") == "1")
+    args = parser.parse_args(argv)
+    missing = [
+        name
+        for name in (
+            "manifest",
+            "output_dir",
+            "views",
+            "resolution",
+            "points",
+            "seed",
+            "min_faces",
+            "max_faces",
+            "camera_radius",
+            "elevation_min",
+            "elevation_max",
+        )
+        if getattr(args, name) is None
+    ]
+    if missing:
+        parser.error("Missing worker arguments: " + ", ".join(missing))
+    return args
 
 
 def clean_scene():
@@ -129,8 +178,14 @@ def configure_render(resolution, use_gpu):
     scene.render.resolution_x = resolution
     scene.render.resolution_y = resolution
     scene.render.film_transparent = True
-    scene.view_settings.view_transform = "Filmic"
-    scene.view_settings.look = "Medium High Contrast"
+    try:
+        scene.view_settings.view_transform = "Filmic"
+    except Exception:
+        scene.view_settings.view_transform = "Standard"
+    try:
+        scene.view_settings.look = "Medium High Contrast"
+    except Exception:
+        pass
     scene.render.image_settings.file_format = IMAGE_FORMAT
     scene.render.image_settings.color_mode = "RGBA"
     scene.world = bpy.data.worlds.new("World") if scene.world is None else scene.world
@@ -161,7 +216,10 @@ def import_object(path):
     if suffix == ".glb" or suffix == ".gltf":
         bpy.ops.import_scene.gltf(filepath=path)
     elif suffix == ".obj":
-        bpy.ops.wm.obj_import(filepath=path)
+        if hasattr(bpy.ops.wm, "obj_import"):
+            bpy.ops.wm.obj_import(filepath=path)
+        else:
+            bpy.ops.import_scene.obj(filepath=path)
     elif suffix == ".fbx":
         bpy.ops.import_scene.fbx(filepath=path)
     elif suffix == ".dae":
@@ -289,13 +347,20 @@ def export_normalized_glb(path):
     bpy.ops.object.select_all(action="DESELECT")
     for obj in mesh_objects():
         obj.select_set(True)
-    bpy.ops.export_scene.gltf(
-        filepath=str(path),
-        export_format="GLB",
-        use_selection=True,
-        export_yup=True,
-        export_apply=True,
-    )
+    kwargs = {
+        "filepath": str(path),
+        "export_format": "GLB",
+        "use_selection": True,
+        "export_apply": True,
+    }
+    try:
+        bpy.ops.export_scene.gltf(**kwargs, export_yup=True)
+    except TypeError:
+        try:
+            bpy.ops.export_scene.gltf(**kwargs)
+        except TypeError:
+            kwargs.pop("export_apply", None)
+            bpy.ops.export_scene.gltf(**kwargs)
 
 
 def triangulated_mesh_data():
@@ -965,6 +1030,22 @@ def build_dataset(args: argparse.Namespace) -> None:
 
         env = os.environ.copy()
         env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        env.update(
+            {
+                "OBJAVERSE_WORKER_MANIFEST": str(manifest),
+                "OBJAVERSE_WORKER_OUTPUT_DIR": str(output_dir),
+                "OBJAVERSE_WORKER_VIEWS": str(args.views),
+                "OBJAVERSE_WORKER_RESOLUTION": str(args.resolution),
+                "OBJAVERSE_WORKER_POINTS": str(args.points),
+                "OBJAVERSE_WORKER_SEED": str(args.seed),
+                "OBJAVERSE_WORKER_MIN_FACES": str(args.min_faces),
+                "OBJAVERSE_WORKER_MAX_FACES": str(args.max_faces),
+                "OBJAVERSE_WORKER_CAMERA_RADIUS": str(args.camera_radius),
+                "OBJAVERSE_WORKER_ELEVATION_MIN": str(args.elevation_min),
+                "OBJAVERSE_WORKER_ELEVATION_MAX": str(args.elevation_max),
+                "OBJAVERSE_WORKER_USE_GPU": "1" if args.use_gpu else "0",
+            }
+        )
         cmd = [
             str(blender),
             "--background",
