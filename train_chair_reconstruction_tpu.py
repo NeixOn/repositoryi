@@ -49,9 +49,29 @@ def maybe_extract_dataset(dataset_root: Path, work_dir: Path) -> Path:
         return dataset_root
 
     zip_names = ("metadata.zip", "objects.zip", "renders.zip")
+    if not dataset_root.exists() and Path("/kaggle/input").exists():
+        candidates = []
+        for root in Path("/kaggle/input").iterdir():
+            if not root.is_dir():
+                continue
+            has_extracted = (root / "metadata" / "views.csv").exists()
+            has_zips = all((root / name).exists() for name in zip_names)
+            if has_extracted or has_zips:
+                candidates.append(root)
+        if len(candidates) == 1:
+            print(f"Dataset root {dataset_root} not found. Using detected Kaggle input: {candidates[0]}", flush=True)
+            dataset_root = candidates[0].resolve()
+        elif len(candidates) > 1:
+            names = "\n".join(str(c) for c in candidates)
+            raise FileNotFoundError(
+                f"Dataset root {dataset_root} not found. Multiple possible Kaggle inputs detected:\n{names}\n"
+                "Pass the correct one with --dataset_root."
+            )
+
     if not all((dataset_root / name).exists() for name in zip_names):
         raise FileNotFoundError(
-            f"Could not find extracted metadata/views.csv or Kaggle zip files under {dataset_root}"
+            f"Could not find extracted metadata/views.csv or Kaggle zip files under {dataset_root}. "
+            "In Kaggle, check the real folder name with: !ls -la /kaggle/input"
         )
 
     extracted = work_dir / "dataset_extracted"
