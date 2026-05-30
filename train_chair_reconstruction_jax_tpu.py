@@ -242,7 +242,6 @@ def main():
     state = State.create(apply_fn=model.apply, params=variables["params"], tx=tx, batch_stats=variables.get("batch_stats", {}))
     state = replicate_tree(state, jax.local_devices())
 
-    @jax.pmap(axis_name="batch")
     def train_step(state, batch):
         def loss_fn(params):
             vars_in = {"params": params, "batch_stats": state.batch_stats}
@@ -255,11 +254,13 @@ def main():
         state = state.apply_gradients(grads=grads, batch_stats=updates["batch_stats"])
         return state, loss
 
-    @jax.pmap(axis_name="batch")
     def eval_step(state, batch):
         pred = state.apply_fn({"params": state.params, "batch_stats": state.batch_stats}, batch["image"], training=False)
         loss = chamfer(pred, batch["points"])
         return jax.lax.pmean(loss, axis_name="batch")
+
+    train_step = jax.pmap(train_step, axis_name="batch")
+    eval_step = jax.pmap(eval_step, axis_name="batch")
 
     train_iter = batch_iterator(train_rows, args.image_size, args.target_points, global_batch, args.seed, True)
     val_iter = batch_iterator(val_rows, args.image_size, args.target_points, global_batch, args.seed + 999, False)
