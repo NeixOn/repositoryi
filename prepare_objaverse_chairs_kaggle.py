@@ -54,6 +54,37 @@ DEFAULT_CATEGORIES = (
     "rocking_chair",
     "swivel_chair",
 )
+DEFAULT_METADATA_KEYWORDS = (
+    "chair",
+    "chairs",
+    "armchair",
+    "arm chair",
+    "stool",
+    "seat",
+    "seating",
+    "dining chair",
+    "office chair",
+    "gaming chair",
+    "bar chair",
+    "bar stool",
+    "lounge chair",
+    "rocking chair",
+    "folding chair",
+    "wooden chair",
+    "plastic chair",
+    "swivel chair",
+)
+DEFAULT_METADATA_EXCLUDE_KEYWORDS = (
+    "wheelchair",
+    "electric chair",
+    "highchair",
+    "high chair",
+    "chairlift",
+    "chair lift",
+    "hair chair",
+    "dental chair",
+    "massage chair",
+)
 
 
 BLENDER_WORKER_CODE = r'''
@@ -917,7 +948,50 @@ def normalize_categories(raw: str | None) -> List[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
-def select_chair_uids(categories: Sequence[str], seed: int, max_candidates: int | None) -> List[str]:
+def normalize_keywords(raw: str | None, defaults: Sequence[str]) -> List[str]:
+    if not raw:
+        return list(defaults)
+    return [part.strip().lower() for part in raw.split(",") if part.strip()]
+
+
+def annotation_text(annotation) -> str:
+    parts: List[str] = []
+
+    def visit(value) -> None:
+        if value is None:
+            return
+        if isinstance(value, str):
+            parts.append(value)
+            return
+        if isinstance(value, (int, float, bool)):
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                visit(item)
+
+    visit(annotation)
+    return " ".join(parts).lower().replace("_", " ").replace("-", " ")
+
+
+def keyword_match(text: str, keywords: Sequence[str]) -> bool:
+    padded = f" {text} "
+    for keyword in keywords:
+        token = keyword.lower().replace("_", " ").replace("-", " ").strip()
+        if not token:
+            continue
+        if " " in token:
+            if token in text:
+                return True
+        elif f" {token} " in padded or (token in ("chair", "stool", "seat") and token in text):
+            return True
+    return False
+
+
+def select_lvis_chair_uids(categories: Sequence[str]) -> tuple[List[str], List[str]]:
     import objaverse
 
     print("Loading Objaverse LVIS annotations...", flush=True)
@@ -935,9 +1009,65 @@ def select_chair_uids(categories: Sequence[str], seed: int, max_candidates: int 
     if not selected_uids:
         for key, uids in lvis.items():
             low = key.lower()
-            if "chair" in low or "stool" in low:
+            if "chair" in low or "stool" in low or "seat" in low:
                 selected_categories.append(key)
                 selected_uids.extend(uids)
+
+    return sorted(set(selected_uids)), selected_categories
+
+
+def select_annotation_chair_uids(
+    keywords: Sequence[str],
+    exclude_keywords: Sequence[str],
+) -> List[str]:
+    import objaverse
+
+    print("Loading Objaverse annotations for broad metadata search...", flush=True)
+    annotations = objaverse.load_annotations()
+    if not isinstance(annotations, dict):
+        raise RuntimeError("objaverse.load_annotations() did not return a uid->annotation dictionary")
+
+    selected = []
+    scanned = 0
+    for uid, annotation in annotations.items():
+        scanned += 1
+        text = annotation_text(annotation)
+        if not text:
+            continue
+        if exclude_keywords and keyword_match(text, exclude_keywords):
+            continue
+        if keyword_match(text, keywords):
+            selected.append(uid)
+
+    selected = sorted(set(selected))
+    print(f"Metadata search scanned annotations: {scanned}", flush=True)
+    print(f"Metadata keyword candidate UIDs: {len(selected)}", flush=True)
+    return selected
+
+
+def select_chair_uids(
+    categories: Sequence[str],
+    seed: int,
+    max_candidates: int | None,
+    candidate_source: str,
+    metadata_keywords: Sequence[str],
+    metadata_exclude_keywords: Sequence[str],
+) -> List[str]:
+    selected_categories: List[str] = []
+    selected_uids: List[str] = []
+
+    if candidate_source in ("lvis", "hybrid"):
+        lvis_uids, selected_categories = select_lvis_chair_uids(categories)
+        selected_uids.extend(lvis_uids)
+        print(f"Selected LVIS categories: {selected_categories}", flush=True)
+        print(f"LVIS chair-like candidate UIDs: {len(lvis_uids)}", flush=True)
+
+    if candidate_source in ("metadata", "hybrid"):
+        metadata_uids = select_annotation_chair_uids(metadata_keywords, metadata_exclude_keywords)
+        before = len(set(selected_uids))
+        selected_uids.extend(metadata_uids)
+        after = len(set(selected_uids))
+        print(f"Added metadata candidates: {after - before}", flush=True)
 
     selected_uids = sorted(set(selected_uids))
     rng = random.Random(seed)
@@ -945,10 +1075,10 @@ def select_chair_uids(categories: Sequence[str], seed: int, max_candidates: int 
     if max_candidates:
         selected_uids = selected_uids[:max_candidates]
 
-    print(f"Selected LVIS categories: {selected_categories}", flush=True)
-    print(f"Candidate chair-like UIDs: {len(selected_uids)}", flush=True)
+    print(f"Candidate source: {candidate_source}", flush=True)
+    print(f"Total shuffled chair-like candidate UIDs: {len(selected_uids)}", flush=True)
     if not selected_uids:
-        raise RuntimeError("No chair UIDs found in Objaverse LVIS annotations.")
+        raise RuntimeError("No chair UIDs found. Try --candidate_source hybrid or broaden --metadata_keywords.")
     return selected_uids
 
 
@@ -1288,7 +1418,10 @@ def write_dataset_info(args: argparse.Namespace, output_dir: Path, accepted: int
         "views_per_object": args.views,
         "resolution": args.resolution,
         "points_per_object": args.points,
+        "candidate_source": args.candidate_source,
         "categories": normalize_categories(args.categories),
+        "metadata_keywords": normalize_keywords(args.metadata_keywords, DEFAULT_METADATA_KEYWORDS),
+        "metadata_exclude_keywords": normalize_keywords(args.metadata_exclude_keywords, DEFAULT_METADATA_EXCLUDE_KEYWORDS),
         "kaggle_persistence_note": (
             "This dataset is written under /kaggle/working by default. "
             "Kaggle keeps files from /kaggle/working as notebook output after Save Version/Commit."
@@ -1480,8 +1613,17 @@ def build_dataset(args: argparse.Namespace) -> None:
         )
 
     categories = normalize_categories(args.categories)
+    metadata_keywords = normalize_keywords(args.metadata_keywords, DEFAULT_METADATA_KEYWORDS)
+    metadata_exclude_keywords = normalize_keywords(args.metadata_exclude_keywords, DEFAULT_METADATA_EXCLUDE_KEYWORDS)
     max_candidates = args.max_candidates if args.max_candidates > 0 else None
-    candidate_uids = select_chair_uids(categories, args.seed, max_candidates)
+    candidate_uids = select_chair_uids(
+        categories,
+        args.seed,
+        max_candidates,
+        args.candidate_source,
+        metadata_keywords,
+        metadata_exclude_keywords,
+    )
 
     accepted = count_rows(metadata_dir / "objects.csv")
     attempted = set()
@@ -1675,7 +1817,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blender_dir", default=DEFAULT_BLENDER_DIR)
     parser.add_argument("--blender_version", default=DEFAULT_BLENDER_VERSION)
     parser.add_argument("--num_objects", type=int, default=200)
-    parser.add_argument("--max_candidates", type=int, default=2000)
+    parser.add_argument("--max_candidates", type=int, default=20000)
     parser.add_argument("--download_batch", type=int, default=24)
     parser.add_argument("--download_processes", type=int, default=8)
     parser.add_argument("--views", type=int, default=12)
@@ -1695,6 +1837,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--categories", default=",".join(DEFAULT_CATEGORIES))
+    parser.add_argument(
+        "--candidate_source",
+        choices=("lvis", "metadata", "hybrid"),
+        default="hybrid",
+        help="lvis is strict but small; metadata is broad but noisy; hybrid uses both.",
+    )
+    parser.add_argument(
+        "--metadata_keywords",
+        default=",".join(DEFAULT_METADATA_KEYWORDS),
+        help="Comma-separated Objaverse annotation keywords used when --candidate_source is metadata or hybrid.",
+    )
+    parser.add_argument(
+        "--metadata_exclude_keywords",
+        default=",".join(DEFAULT_METADATA_EXCLUDE_KEYWORDS),
+        help="Comma-separated keywords to reject during broad metadata search.",
+    )
     parser.add_argument(
         "--allowed_licenses",
         default="",
