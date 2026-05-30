@@ -38,6 +38,7 @@ import sys
 import tarfile
 import time
 import urllib.request
+import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
 
@@ -1385,6 +1386,36 @@ def python_process_chunk(entries: Sequence[dict], output_dir: Path, args: argpar
     object_rows = []
     view_rows = []
     failed_rows = []
+    workers = max(1, int(getattr(args, "process_workers", 1)))
+
+    if workers > 1 and len(entries) > 1:
+        print(f"[python] Processing {len(entries)} objects with {workers} workers", flush=True)
+        tasks = [(index, entry, output_dir, args) for index, entry in enumerate(entries)]
+        with mp.get_context("spawn").Pool(processes=workers) as pool:
+            for result in pool.imap_unordered(python_process_one_task, tasks):
+                index = result["index"]
+                uid = result["uid"]
+                if result["ok"]:
+                    object_rows.append(result["object_row"])
+                    view_rows.extend(result["view_rows"])
+                    print(f"[python] DONE {index + 1}/{len(entries)} {uid}", flush=True)
+                else:
+                    failed_rows.append({
+                        "uid": uid,
+                        "source_path": result.get("source_path", ""),
+                        "error": result["error"],
+                        "traceback": result["traceback"],
+                    })
+                    print(f"[python] FAILED {uid}: {result['error']}", flush=True)
+        object_rows.sort(key=lambda row: row["uid"])
+        view_rows.sort(key=lambda row: (row["uid"], int(row["view_index"])))
+        failed_rows.sort(key=lambda row: row["uid"])
+        write_rows_csv(metadata_dir / "objects_chunk.csv", object_rows)
+        write_rows_csv(metadata_dir / "views_chunk.csv", view_rows)
+        write_rows_csv(metadata_dir / "failed_chunk.csv", failed_rows)
+        print(f"[python] Chunk complete: accepted={len(object_rows)} failed={len(failed_rows)} views={len(view_rows)}", flush=True)
+        return
+
     for index, entry in enumerate(entries):
         uid = entry["uid"]
         print(f"[python] Processing {index + 1}/{len(entries)} {uid}", flush=True)
@@ -1405,6 +1436,29 @@ def python_process_chunk(entries: Sequence[dict], output_dir: Path, args: argpar
     write_rows_csv(metadata_dir / "views_chunk.csv", view_rows)
     write_rows_csv(metadata_dir / "failed_chunk.csv", failed_rows)
     print(f"[python] Chunk complete: accepted={len(object_rows)} failed={len(failed_rows)} views={len(view_rows)}", flush=True)
+
+
+def python_process_one_task(task) -> dict:
+    index, entry, output_dir, args = task
+    uid = entry["uid"]
+    try:
+        object_row, rows = python_process_one(entry, output_dir, args, index)
+        return {
+            "ok": True,
+            "index": index,
+            "uid": uid,
+            "object_row": object_row,
+            "view_rows": rows,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "index": index,
+            "uid": uid,
+            "source_path": entry.get("path", ""),
+            "error": str(exc),
+            "traceback": repr(exc),
+        }
 
 
 def write_dataset_info(args: argparse.Namespace, output_dir: Path, accepted: int) -> None:
@@ -1820,6 +1874,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_candidates", type=int, default=20000)
     parser.add_argument("--download_batch", type=int, default=24)
     parser.add_argument("--download_processes", type=int, default=8)
+    parser.add_argument(
+        "--process_workers",
+        type=int,
+        default=1,
+        help="For --renderer python, process this many downloaded objects in parallel. Try 2 first, then 4 if RAM is stable.",
+    )
     parser.add_argument("--views", type=int, default=12)
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--points", type=int, default=32768)
@@ -1938,6 +1998,8 @@ def main() -> None:
         raise ValueError("--resolution must be positive")
     if args.download_batch <= 0:
         raise ValueError("--download_batch must be positive")
+    if args.process_workers <= 0:
+        raise ValueError("--process_workers must be positive")
     if args.publish_every_batches <= 0:
         raise ValueError("--publish_every_batches must be positive")
     if args.publish_to_kaggle and not args.kaggle_dataset_id:
