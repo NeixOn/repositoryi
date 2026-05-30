@@ -133,9 +133,8 @@ def shard_batch(batch: dict, devices: int):
 
 def replicate_tree(tree, devices):
     import jax
-    import jax.numpy as jnp
 
-    return jax.tree_util.tree_map(lambda x: jax.device_put(jnp.stack([x] * len(devices)), devices), tree)
+    return jax.tree_util.tree_map(lambda x: jax.device_put_sharded([x] * len(devices), devices), tree)
 
 
 def main():
