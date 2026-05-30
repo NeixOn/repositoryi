@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -32,9 +31,10 @@ def ensure_deps(skip_install: bool) -> None:
 def load_image(path: Path, image_size: int, crop: bool):
     from PIL import Image
 
-    img = Image.open(path).convert("RGB")
+    original = Image.open(path).convert("RGB")
+    cropped = original
     if crop:
-        arr = np.asarray(img, dtype=np.uint8)
+        arr = np.asarray(cropped, dtype=np.uint8)
         # If there is a light/white background, crop to non-background pixels.
         mask = np.any(arr < 245, axis=-1)
         if mask.any():
@@ -44,10 +44,10 @@ def load_image(path: Path, image_size: int, crop: bool):
             x1 = min(arr.shape[1], int(xs.max()) + pad + 1)
             y0 = max(0, int(ys.min()) - pad)
             y1 = min(arr.shape[0], int(ys.max()) + pad + 1)
-            img = img.crop((x0, y0, x1, y1))
-    img = img.resize((image_size, image_size))
-    image = np.asarray(img, dtype=np.float32) / 255.0
-    return image, img
+            cropped = cropped.crop((x0, y0, x1, y1))
+    resized = cropped.resize((image_size, image_size))
+    image = np.asarray(resized, dtype=np.float32) / 255.0
+    return image, original, cropped, resized
 
 
 def write_ply(path: Path, points: np.ndarray, color=(35, 105, 210)) -> None:
@@ -79,15 +79,31 @@ def render_point_preview(points: np.ndarray, size: int):
     return Image.fromarray(img, mode="RGB")
 
 
-def save_preview(path: Path, input_img, pred: np.ndarray) -> None:
+def fit_preview(img, size):
+    from PIL import Image
+
+    canvas = Image.new("RGB", (size, size), (255, 255, 255))
+    work = img.copy()
+    work.thumbnail((size, size), Image.BILINEAR)
+    x = (size - work.width) // 2
+    y = (size - work.height) // 2
+    canvas.paste(work, (x, y))
+    return canvas
+
+
+def save_preview(path: Path, original_img, cropped_img, resized_img, pred: np.ndarray) -> None:
     from PIL import Image, ImageDraw
 
-    panel = Image.new("RGB", (512, 288), (255, 255, 255))
-    panel.paste(input_img.resize((256, 256)), (0, 24))
-    panel.paste(render_point_preview(pred, 256), (256, 24))
+    panel = Image.new("RGB", (1024, 288), (255, 255, 255))
+    panel.paste(fit_preview(original_img, 256), (0, 24))
+    panel.paste(fit_preview(cropped_img, 256), (256, 24))
+    panel.paste(resized_img.resize((256, 256)), (512, 24))
+    panel.paste(render_point_preview(pred, 256), (768, 24))
     draw = ImageDraw.Draw(panel)
-    draw.text((8, 4), "input", fill=(0, 0, 0))
-    draw.text((264, 4), "prediction", fill=(0, 0, 0))
+    draw.text((8, 4), f"original {original_img.width}x{original_img.height}", fill=(0, 0, 0))
+    draw.text((264, 4), f"after crop {cropped_img.width}x{cropped_img.height}", fill=(0, 0, 0))
+    draw.text((520, 4), f"model input {resized_img.width}x{resized_img.height}", fill=(0, 0, 0))
+    draw.text((776, 4), "prediction", fill=(0, 0, 0))
     path.parent.mkdir(parents=True, exist_ok=True)
     panel.save(path)
 
@@ -185,7 +201,7 @@ def main() -> None:
     class State(train_state.TrainState):
         pass
 
-    image, input_img = load_image(Path(args.image), args.image_size, args.crop)
+    image, original_img, cropped_img, resized_img = load_image(Path(args.image), args.image_size, args.crop)
     model = ChairLRMLite(args.pred_points)
     variables = model.init(jax.random.PRNGKey(42), jnp.ones((1, args.image_size, args.image_size, 3), jnp.float32), training=False)
     schedule = optax.cosine_decay_schedule(5e-5, decay_steps=1, alpha=0.03)
@@ -202,17 +218,23 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(args.image).stem
-    input_path = output_dir / f"{stem}_input.png"
+    original_path = output_dir / f"{stem}_original.png"
+    crop_path = output_dir / f"{stem}_after_crop.png"
+    input_path = output_dir / f"{stem}_model_input_{args.image_size}.png"
     pred_path = output_dir / f"{stem}_pred.ply"
     npy_path = output_dir / f"{stem}_pred.npy"
     preview_path = output_dir / f"{stem}_preview.png"
 
-    input_img.save(input_path)
+    original_img.save(original_path)
+    cropped_img.save(crop_path)
+    resized_img.save(input_path)
     write_ply(pred_path, pred)
     np.save(npy_path, pred)
-    save_preview(preview_path, input_img, pred)
+    save_preview(preview_path, original_img, cropped_img, resized_img, pred)
 
-    print(f"Input: {input_path}", flush=True)
+    print(f"Original: {original_path}", flush=True)
+    print(f"After crop: {crop_path}", flush=True)
+    print(f"Model input: {input_path}", flush=True)
     print(f"Prediction PLY: {pred_path}", flush=True)
     print(f"Prediction NPY: {npy_path}", flush=True)
     print(f"Preview: {preview_path}", flush=True)
