@@ -24,7 +24,7 @@ import numpy as np
 def ensure_deps(skip_install: bool) -> None:
     if skip_install:
         return
-    pkgs = ["flax", "optax", "orbax-checkpoint", "Pillow"]
+    pkgs = ["flax", "optax", "orbax-checkpoint", "Pillow", "open3d"]
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", *pkgs], check=True)
 
 
@@ -61,6 +61,54 @@ def write_ply(path: Path, points: np.ndarray, color=(35, 105, 210)) -> None:
         f.write("end_header\n")
         for p in points:
             f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {int(color[0])} {int(color[1])} {int(color[2])}\n")
+
+
+def write_mesh_from_points(
+    points: np.ndarray,
+    mesh_ply_path: Path,
+    mesh_obj_path: Path,
+    poisson_depth: int,
+    density_quantile: float,
+    smooth_iterations: int,
+) -> tuple[Path, Path]:
+    import open3d as o3d
+
+    mesh_ply_path.parent.mkdir(parents=True, exist_ok=True)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+    pcd.colors = o3d.utility.Vector3dVector(np.tile(np.array([[0.14, 0.42, 0.82]], dtype=np.float64), (len(points), 1)))
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.18, max_nn=48)
+    )
+    pcd.orient_normals_consistent_tangent_plane(32)
+
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd,
+        depth=poisson_depth,
+        width=0,
+        scale=1.08,
+        linear_fit=False,
+    )
+    densities = np.asarray(densities)
+    if len(densities) > 0:
+        threshold = np.quantile(densities, density_quantile)
+        mesh.remove_vertices_by_mask(densities < threshold)
+    bbox = pcd.get_axis_aligned_bounding_box()
+    bbox = bbox.scale(1.08, bbox.get_center())
+    mesh = mesh.crop(bbox)
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_non_manifold_edges()
+    if smooth_iterations > 0:
+        mesh = mesh.filter_smooth_simple(number_of_iterations=smooth_iterations)
+    mesh.compute_vertex_normals()
+
+    if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+        raise RuntimeError("Mesh reconstruction produced an empty mesh")
+    o3d.io.write_triangle_mesh(str(mesh_ply_path), mesh, write_ascii=False)
+    o3d.io.write_triangle_mesh(str(mesh_obj_path), mesh, write_ascii=True)
+    return mesh_ply_path, mesh_obj_path
 
 
 def render_point_preview(points: np.ndarray, size: int):
@@ -128,6 +176,10 @@ def main() -> None:
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--pred_points", type=int, default=8192)
     parser.add_argument("--crop", action="store_true", help="Crop light/white background around the object before resizing")
+    parser.add_argument("--no_mesh", action="store_true", help="Only save point cloud, skip Poisson mesh reconstruction")
+    parser.add_argument("--poisson_depth", type=int, default=8)
+    parser.add_argument("--mesh_density_quantile", type=float, default=0.04)
+    parser.add_argument("--mesh_smooth_iterations", type=int, default=1)
     parser.add_argument("--skip_install", action="store_true")
     args = parser.parse_args()
 
@@ -223,6 +275,8 @@ def main() -> None:
     input_path = output_dir / f"{stem}_model_input_{args.image_size}.png"
     pred_path = output_dir / f"{stem}_pred.ply"
     npy_path = output_dir / f"{stem}_pred.npy"
+    mesh_ply_path = output_dir / f"{stem}_mesh.ply"
+    mesh_obj_path = output_dir / f"{stem}_mesh.obj"
     preview_path = output_dir / f"{stem}_preview.png"
 
     original_img.save(original_path)
@@ -230,6 +284,20 @@ def main() -> None:
     resized_img.save(input_path)
     write_ply(pred_path, pred)
     np.save(npy_path, pred)
+    mesh_ok = False
+    if not args.no_mesh:
+        try:
+            write_mesh_from_points(
+                pred,
+                mesh_ply_path,
+                mesh_obj_path,
+                args.poisson_depth,
+                args.mesh_density_quantile,
+                args.mesh_smooth_iterations,
+            )
+            mesh_ok = True
+        except Exception as exc:
+            print(f"Mesh reconstruction failed, point cloud was still saved: {exc}", flush=True)
     save_preview(preview_path, original_img, cropped_img, resized_img, pred)
 
     print(f"Original: {original_path}", flush=True)
@@ -237,6 +305,9 @@ def main() -> None:
     print(f"Model input: {input_path}", flush=True)
     print(f"Prediction PLY: {pred_path}", flush=True)
     print(f"Prediction NPY: {npy_path}", flush=True)
+    if mesh_ok:
+        print(f"Mesh PLY: {mesh_ply_path}", flush=True)
+        print(f"Mesh OBJ: {mesh_obj_path}", flush=True)
     print(f"Preview: {preview_path}", flush=True)
 
 
