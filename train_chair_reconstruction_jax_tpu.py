@@ -25,6 +25,7 @@ import random
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -166,6 +167,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train_ratio", type=float, default=0.8)
     parser.add_argument("--val_ratio", type=float, default=0.1)
+    parser.add_argument("--log_every", type=int, default=25)
     parser.add_argument("--skip_install", action="store_true")
     args = parser.parse_args()
 
@@ -274,21 +276,42 @@ def main():
         writer.writerow(["epoch", "train_chamfer", "val_chamfer"])
 
         for epoch in range(1, args.epochs + 1):
+            epoch_start = time.time()
             train_losses = []
-            for _ in range(steps_per_epoch):
+            for step in range(1, steps_per_epoch + 1):
                 batch = shard_batch(next(train_iter), devices)
                 state, loss = train_step(state, batch)
                 train_losses.append(float(np.asarray(loss)[0]))
+                if args.log_every > 0 and (step == 1 or step % args.log_every == 0 or step == steps_per_epoch):
+                    elapsed = time.time() - epoch_start
+                    sec_per_step = elapsed / step
+                    epoch_eta = sec_per_step * (steps_per_epoch - step)
+                    total_remaining_steps = (args.epochs - epoch) * steps_per_epoch + (steps_per_epoch - step)
+                    total_eta = sec_per_step * total_remaining_steps
+                    print(
+                        f"epoch={epoch:03d}/{args.epochs} step={step:04d}/{steps_per_epoch} "
+                        f"train_chamfer={train_losses[-1]:.6f} "
+                        f"sec/step={sec_per_step:.2f} "
+                        f"epoch_eta_min={epoch_eta / 60:.1f} total_eta_hr={total_eta / 3600:.2f}",
+                        flush=True,
+                    )
             val_losses = []
+            val_start = time.time()
             for _ in range(val_steps):
                 batch = shard_batch(next(val_iter), devices)
                 val_loss = eval_step(state, batch)
                 val_losses.append(float(np.asarray(val_loss)[0]))
             train_loss = float(np.mean(train_losses))
             val_loss = float(np.mean(val_losses))
+            epoch_time = time.time() - epoch_start
+            val_time = time.time() - val_start
             writer.writerow([epoch, train_loss, val_loss])
             f.flush()
-            print(f"epoch={epoch:03d} train_chamfer={train_loss:.6f} val_chamfer={val_loss:.6f}", flush=True)
+            print(
+                f"epoch={epoch:03d} train_chamfer={train_loss:.6f} val_chamfer={val_loss:.6f} "
+                f"epoch_min={epoch_time / 60:.1f} val_min={val_time / 60:.1f}",
+                flush=True,
+            )
 
             if val_loss < best_val:
                 best_val = val_loss
