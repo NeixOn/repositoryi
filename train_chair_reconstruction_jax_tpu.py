@@ -131,6 +131,13 @@ def shard_batch(batch: dict, devices: int):
     return {k: v.reshape((devices, v.shape[0] // devices) + v.shape[1:]) for k, v in batch.items()}
 
 
+def replicate_tree(tree, devices):
+    import jax
+    import jax.numpy as jnp
+
+    return jax.tree_util.tree_map(lambda x: jax.device_put(jnp.stack([x] * len(devices)), devices), tree)
+
+
 def main():
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--skip_install", action="store_true")
@@ -233,7 +240,7 @@ def main():
     schedule = optax.cosine_decay_schedule(args.lr, decay_steps=max(1, steps_per_epoch * args.epochs), alpha=0.01)
     tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(schedule, weight_decay=1e-4))
     state = State.create(apply_fn=model.apply, params=variables["params"], tx=tx, batch_stats=variables.get("batch_stats", {}))
-    state = jax.device_put_replicated(state, jax.local_devices())
+    state = replicate_tree(state, jax.local_devices())
 
     @jax.pmap(axis_name="batch")
     def train_step(state, batch):
