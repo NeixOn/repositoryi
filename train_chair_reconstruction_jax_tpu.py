@@ -133,8 +133,18 @@ def shard_batch(batch: dict, devices: int):
 
 def replicate_tree(tree, devices):
     import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh, PmapSharding
 
-    return jax.tree_util.tree_map(lambda x: jax.device_put_sharded([x] * len(devices), devices), tree)
+    sharding = PmapSharding(Mesh(np.array(devices), ("batch",)), jax.sharding.PartitionSpec("batch"))
+
+    def _replicate(x):
+        shards = [jax.device_put(x, device) for device in devices]
+        shape = (len(devices),) + x.shape
+        return jax.make_array_from_single_device_arrays(shape, sharding, shards)
+
+    return jax.tree_util.tree_map(_replicate, tree)
 
 
 def main():
