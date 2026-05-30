@@ -212,6 +212,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_every", type=int, default=25)
     parser.add_argument("--fscore_thresholds", default="0.02,0.05")
+    parser.add_argument("--resume_from", default="", help="Optional Orbax checkpoint directory, e.g. /kaggle/working/chair_lrm_tpu/best_orbax")
     parser.add_argument("--skip_install", action="store_true")
     args = parser.parse_args()
 
@@ -370,6 +371,13 @@ def main() -> None:
         optax.adamw(schedule, b1=0.9, b2=0.95, weight_decay=args.weight_decay),
     )
     state = State.create(apply_fn=model.apply, params=variables["params"], tx=tx)
+    if args.resume_from:
+        resume_path = Path(args.resume_from)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"--resume_from does not exist: {resume_path}")
+        ckptr = ocp.PyTreeCheckpointer()
+        state = ckptr.restore(resume_path, item=state)
+        print(f"Resumed checkpoint: {resume_path}", flush=True)
     state = replicate_tree(state, jax.local_devices())
 
     def train_step(state, batch, rng_key):
