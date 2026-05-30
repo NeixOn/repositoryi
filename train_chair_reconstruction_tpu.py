@@ -294,15 +294,29 @@ class ChairReconModel(tf.keras.Model):
 
 
 def setup_strategy():
-    try:
-        resolver = tf.distribute.cluster_resolver.TPUClusterResolver()
-        tf.config.experimental_connect_to_cluster(resolver)
-        tf.tpu.experimental.initialize_tpu_system(resolver)
-        print("TPU initialized:", resolver.cluster_spec().as_dict(), flush=True)
-        return tf.distribute.TPUStrategy(resolver)
-    except Exception as exc:
-        print(f"TPU not found, using default strategy: {exc}", flush=True)
-        return tf.distribute.get_strategy()
+    candidates = []
+    for env_name in ("TPU_NAME", "COLAB_TPU_ADDR", "KAGGLE_TPU_ADDR"):
+        value = os.environ.get(env_name)
+        if value:
+            candidates.append(value)
+    candidates.extend(["local", None])
+
+    errors = []
+    for candidate in candidates:
+        try:
+            if candidate is None:
+                resolver = tf.distribute.cluster_resolver.TPUClusterResolver()
+            else:
+                resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu=candidate)
+            tf.config.experimental_connect_to_cluster(resolver)
+            tf.tpu.experimental.initialize_tpu_system(resolver)
+            print(f"TPU initialized with candidate={candidate!r}: {resolver.cluster_spec().as_dict()}", flush=True)
+            return tf.distribute.TPUStrategy(resolver)
+        except Exception as exc:
+            errors.append(f"{candidate!r}: {exc}")
+
+    print("TPU not found, using default strategy. Tried:\n" + "\n".join(errors), flush=True)
+    return tf.distribute.get_strategy()
 
 
 def parse_args():
