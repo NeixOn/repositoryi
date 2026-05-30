@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List
 
+import numpy as np
+
 
 def ensure_deps(skip_install: bool):
     if skip_install:
