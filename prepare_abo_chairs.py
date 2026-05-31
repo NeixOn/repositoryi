@@ -33,6 +33,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
 
@@ -289,6 +290,41 @@ def copy_or_render_placeholder(image_paths: list[Path], out_dir: Path, max_views
     return views
 
 
+def build_image_url(rel_img: str) -> str:
+    rel_img = rel_img.lstrip("/")
+    if rel_img.startswith("__spin__/"):
+        return f"{ABO}/spins/original/{rel_img.removeprefix('__spin__/')}"
+    if rel_img.startswith("spins/") or rel_img.startswith("images/"):
+        return f"{ABO}/{rel_img}"
+    if "/spin" in rel_img.lower() or rel_img.lower().startswith("spin"):
+        return f"{ABO}/spins/original/{rel_img}"
+    return f"{ABO}/images/small/{rel_img}"
+
+
+def download_images_for_object(rel_images: list[str], raw_images_dir: Path, workers: int) -> list[Path]:
+    jobs = []
+    seen = set()
+    for rel_img in rel_images:
+        rel_img = str(rel_img).lstrip("/")
+        if not rel_img or rel_img in seen:
+            continue
+        seen.add(rel_img)
+        dst = raw_images_dir / Path(rel_img).name
+        jobs.append((build_image_url(rel_img), dst))
+    if not jobs:
+        return []
+    if workers <= 1:
+        return [dst for url, dst in jobs if download(url, dst, retries=2)]
+    local = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(download, url, dst, 2): dst for url, dst in jobs}
+        for fut in as_completed(futures):
+            if fut.result():
+                local.append(futures[fut])
+    local.sort()
+    return local
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--output_dir", default="/data/abo_chairs")
@@ -300,6 +336,7 @@ def main() -> None:
     parser.add_argument("--include_keywords", default=DEFAULT_INCLUDE)
     parser.add_argument("--exclude_keywords", default=DEFAULT_EXCLUDE)
     parser.add_argument("--max_total_gb", type=float, default=90.0)
+    parser.add_argument("--download_workers", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip_install", action="store_true")
     args = parser.parse_args()
@@ -392,20 +429,11 @@ def main() -> None:
             except Exception as exc:
                 print(f"[skip] {uid}: {exc}", flush=True)
                 continue
-            local_images = []
-            for rel_img in image_paths_by_model.get(uid, [])[: args.views_per_object * 2]:
-                rel_img = rel_img.lstrip("/")
-                if rel_img.startswith("__spin__/"):
-                    url = f"{ABO}/spins/original/{rel_img.removeprefix('__spin__/')}"
-                elif rel_img.startswith("spins/") or rel_img.startswith("images/"):
-                    url = f"{ABO}/{rel_img}"
-                elif "/spin" in rel_img.lower() or rel_img.lower().startswith("spin"):
-                    url = f"{ABO}/spins/original/{rel_img}"
-                else:
-                    url = f"{ABO}/images/small/{rel_img}"
-                dst = raw_images / uid / Path(rel_img).name
-                if download(url, dst, retries=2):
-                    local_images.append(dst)
+            local_images = download_images_for_object(
+                image_paths_by_model.get(uid, [])[: args.views_per_object * 2],
+                raw_images / uid,
+                args.download_workers,
+            )
             views = copy_or_render_placeholder(local_images, out / "renders" / uid, args.views_per_object)
             if not views:
                 print(f"[skip] {uid}: no usable images", flush=True)
