@@ -325,6 +325,49 @@ def download_images_for_object(rel_images: list[str], raw_images_dir: Path, work
     return local
 
 
+def process_candidate(cand: dict, model_paths: dict, image_paths_by_model: dict, out: Path, raw_models: Path, raw_images: Path, args) -> dict | None:
+    uid = cand["uid"]
+    rel_model = model_paths.get(uid)
+    if not rel_model:
+        return None
+    model_url = f"{ABO}/3dmodels/original/{rel_model.lstrip('/')}"
+    raw_model = raw_models / uid / Path(rel_model).name
+    if not download(model_url, raw_model):
+        return None
+    raw_bytes = raw_model.stat().st_size
+    try:
+        dst_glb = out / "objects" / uid / "normalized.glb"
+        pts = out / "objects" / uid / "points.npz"
+        faces, scale = normalize_mesh(raw_model, dst_glb, pts, args.points, args.seed + stable_uid_seed(uid))
+    except Exception as exc:
+        print(f"[skip] {uid}: {exc}", flush=True)
+        return None
+    local_images = download_images_for_object(
+        image_paths_by_model.get(uid, [])[: args.views_per_object * 2],
+        raw_images / uid,
+        args.download_workers,
+    )
+    views = copy_or_render_placeholder(local_images, out / "renders" / uid, args.views_per_object)
+    if not views:
+        print(f"[skip] {uid}: no usable images", flush=True)
+        shutil.rmtree(out / "objects" / uid, ignore_errors=True)
+        return None
+    return {
+        "uid": uid,
+        "bytes": raw_bytes,
+        "views": len(views),
+        "view_rows": [{"uid": uid, "view_index": vi, "image_path": f"renders/{uid}/view_{vi:03d}.png"} for vi in range(len(views))],
+        "object_row": {"uid": uid, "source": "ABO", "title": cand["title"], "faces": faces, "scale": scale},
+    }
+
+
+def stable_uid_seed(uid: str) -> int:
+    value = 0
+    for ch in uid:
+        value = ((value * 131) + ord(ch)) & 0x7FFFFFFF
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--output_dir", default="/data/abo_chairs")
@@ -337,6 +380,7 @@ def main() -> None:
     parser.add_argument("--exclude_keywords", default=DEFAULT_EXCLUDE)
     parser.add_argument("--max_total_gb", type=float, default=90.0)
     parser.add_argument("--download_workers", type=int, default=32)
+    parser.add_argument("--object_workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip_install", action="store_true")
     args = parser.parse_args()
@@ -407,45 +451,52 @@ def main() -> None:
         ow = csv.DictWriter(of, fieldnames=["uid", "source", "title", "faces", "scale"])
         vw.writeheader()
         ow.writeheader()
-        for cand in candidates:
-            if accepted >= args.num_objects:
-                break
-            uid = cand["uid"]
-            rel_model = model_paths.get(uid)
-            if not rel_model:
-                continue
-            model_url = f"{ABO}/3dmodels/original/{rel_model.lstrip('/')}"
-            raw_model = raw_models / uid / Path(rel_model).name
-            if not download(model_url, raw_model):
-                continue
-            total_bytes += raw_model.stat().st_size
-            if total_bytes / (1024 ** 3) > args.max_total_gb:
-                print(f"Disk budget reached: {total_bytes / (1024 ** 3):.1f} GB", flush=True)
-                break
-            try:
-                dst_glb = out / "objects" / uid / "normalized.glb"
-                pts = out / "objects" / uid / "points.npz"
-                faces, scale = normalize_mesh(raw_model, dst_glb, pts, args.points, args.seed + accepted)
-            except Exception as exc:
-                print(f"[skip] {uid}: {exc}", flush=True)
-                continue
-            local_images = download_images_for_object(
-                image_paths_by_model.get(uid, [])[: args.views_per_object * 2],
-                raw_images / uid,
-                args.download_workers,
-            )
-            views = copy_or_render_placeholder(local_images, out / "renders" / uid, args.views_per_object)
-            if not views:
-                print(f"[skip] {uid}: no usable images", flush=True)
-                shutil.rmtree(out / "objects" / uid, ignore_errors=True)
-                continue
-            for vi, _ in enumerate(views):
-                vw.writerow({"uid": uid, "view_index": vi, "image_path": f"renders/{uid}/view_{vi:03d}.png"})
-            ow.writerow({"uid": uid, "source": "ABO", "title": cand["title"], "faces": faces, "scale": scale})
-            vf.flush()
-            of.flush()
-            accepted += 1
-            print(f"accepted={accepted}/{args.num_objects} uid={uid} views={len(views)}", flush=True)
+        object_workers = max(1, int(args.object_workers))
+        if object_workers == 1:
+            for cand in candidates:
+                if accepted >= args.num_objects:
+                    break
+                result = process_candidate(cand, model_paths, image_paths_by_model, out, raw_models, raw_images, args)
+                if result is None:
+                    continue
+                total_bytes += result["bytes"]
+                if total_bytes / (1024 ** 3) > args.max_total_gb:
+                    print(f"Disk budget reached: {total_bytes / (1024 ** 3):.1f} GB", flush=True)
+                    break
+                for row in result["view_rows"]:
+                    vw.writerow(row)
+                ow.writerow(result["object_row"])
+                vf.flush()
+                of.flush()
+                accepted += 1
+                print(f"accepted={accepted}/{args.num_objects} uid={result['uid']} views={result['views']}", flush=True)
+        else:
+            batch_size = object_workers * 3
+            cursor = 0
+            while accepted < args.num_objects and cursor < len(candidates):
+                batch = candidates[cursor:cursor + batch_size]
+                cursor += batch_size
+                with ThreadPoolExecutor(max_workers=object_workers) as ex:
+                    futures = [
+                        ex.submit(process_candidate, cand, model_paths, image_paths_by_model, out, raw_models, raw_images, args)
+                        for cand in batch
+                    ]
+                    for fut in as_completed(futures):
+                        result = fut.result()
+                        if result is None or accepted >= args.num_objects:
+                            continue
+                        total_bytes += result["bytes"]
+                        if total_bytes / (1024 ** 3) > args.max_total_gb:
+                            print(f"Disk budget reached: {total_bytes / (1024 ** 3):.1f} GB", flush=True)
+                            accepted = args.num_objects
+                            break
+                        for row in result["view_rows"]:
+                            vw.writerow(row)
+                        ow.writerow(result["object_row"])
+                        vf.flush()
+                        of.flush()
+                        accepted += 1
+                        print(f"accepted={accepted}/{args.num_objects} uid={result['uid']} views={result['views']}", flush=True)
 
     info = {"accepted": accepted, "dataset": "ABO chairs subset", "views_per_object": args.views_per_object, "points": args.points}
     (out / "metadata" / "dataset_info.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
