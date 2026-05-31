@@ -352,7 +352,7 @@ def main() -> None:
             sid = str(r.get(spin_id_col, ""))
             path = str(r.get(spin_path_col, ""))
             if sid and path and sid != "nan" and path != "nan":
-                spin_groups.setdefault(sid, []).append(path)
+                spin_groups.setdefault(sid, []).append(f"__spin__/{path.lstrip('/')}")
         for cand in candidates:
             sid = cand.get("spin_id", "")
             if sid and sid in spin_groups:
@@ -395,7 +395,9 @@ def main() -> None:
             local_images = []
             for rel_img in image_paths_by_model.get(uid, [])[: args.views_per_object * 2]:
                 rel_img = rel_img.lstrip("/")
-                if rel_img.startswith("spins/") or rel_img.startswith("images/"):
+                if rel_img.startswith("__spin__/"):
+                    url = f"{ABO}/spins/original/{rel_img.removeprefix('__spin__/')}"
+                elif rel_img.startswith("spins/") or rel_img.startswith("images/"):
                     url = f"{ABO}/{rel_img}"
                 elif "/spin" in rel_img.lower() or rel_img.lower().startswith("spin"):
                     url = f"{ABO}/spins/original/{rel_img}"
