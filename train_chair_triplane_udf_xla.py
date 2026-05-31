@@ -411,12 +411,16 @@ def train(args) -> None:
     try:
         import torch_xla
         import torch_xla.core.xla_model as xm
-        device = torch_xla.device()
+        device = xm.xla_device()
         is_xla = str(device).startswith("xla")
-    except Exception:
+    except Exception as exc:
+        if args.require_tpu or os.environ.get("PJRT_DEVICE", "").upper() == "TPU":
+            raise RuntimeError(f"PyTorch/XLA TPU was requested but could not be initialized: {exc}") from exc
         xm = None
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         is_xla = False
+    if args.require_tpu and not is_xla:
+        raise RuntimeError(f"--require_tpu was set, but selected device is {device}")
 
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -649,6 +653,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--level", type=float, default=0.025)
     parser.add_argument("--crop", action="store_true")
     parser.add_argument("--force_cpu", action="store_true")
+    parser.add_argument("--require_tpu", action="store_true")
     parser.add_argument("--skip_install", action="store_true")
     args = parser.parse_args()
     if args.mode == "train" and not args.dataset_root:
