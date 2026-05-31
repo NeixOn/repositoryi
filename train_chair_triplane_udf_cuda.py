@@ -386,7 +386,8 @@ def train(args):
     if ddp:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
-    steps_total = max(1, args.epochs * max(1, len(train_loader) // args.grad_accum))
+    updates_per_epoch = max(1, len(train_loader) // args.grad_accum)
+    steps_total = max(1, args.epochs * updates_per_epoch)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps_total, eta_min=args.lr * 0.03)
     use_amp = args.amp != "none" and device.type == "cuda"
     amp_dtype = torch.bfloat16 if args.amp == "bf16" else torch.float16
@@ -414,7 +415,24 @@ def train(args):
             target = model.module if ddp else model
             for p in target.encoder.parameters():
                 p.requires_grad = True
-            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.5, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+            finetune_lr = args.encoder_lr if args.encoder_lr > 0 else args.lr * 0.2
+            head_lr = args.lr * 0.5
+            optimizer = torch.optim.AdamW(
+                [
+                    {"params": target.encoder.parameters(), "lr": finetune_lr},
+                    {"params": list(target.triplane.parameters()) + list(target.decoder.parameters()), "lr": head_lr},
+                ],
+                weight_decay=args.weight_decay,
+                betas=(0.9, 0.95),
+            )
+            remaining_epochs = max(1, args.epochs - epoch + 1)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, remaining_epochs * updates_per_epoch),
+                eta_min=args.lr * 0.01,
+            )
+            if is_main(rank):
+                print(f"encoder unfrozen: encoder_lr={finetune_lr:.2e} head_lr={head_lr:.2e}", flush=True)
         model.train()
         start = time.time()
         optimizer.zero_grad(set_to_none=True)
@@ -554,6 +572,7 @@ def parse_args():
     p.add_argument("--no_pretrained_encoder", dest="pretrained_encoder", action="store_false")
     p.add_argument("--freeze_encoder_epochs", type=int, default=5)
     p.add_argument("--lr", type=float, default=1.5e-4)
+    p.add_argument("--encoder_lr", type=float, default=0.0)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--amp", choices=("bf16", "fp16", "none"), default="fp16")
