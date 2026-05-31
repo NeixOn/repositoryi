@@ -32,6 +32,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Iterable
 
@@ -89,6 +90,14 @@ def download(url: str, dst: Path, retries: int = 5) -> bool:
                 shutil.copyfileobj(r, f, length=1024 * 1024)
             tmp.replace(dst)
             return True
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                print(f"[download] 404 not found: {url}", flush=True)
+                return False
+            if tmp.exists():
+                tmp.unlink()
+            print(f"[download] failed {attempt}/{retries}: {url} ({exc})", flush=True)
+            time.sleep(min(30, 2 ** attempt))
         except Exception as exc:
             if tmp.exists():
                 tmp.unlink()
@@ -368,7 +377,7 @@ def main() -> None:
             rel_model = model_paths.get(uid)
             if not rel_model:
                 continue
-            model_url = f"{ABO}/{rel_model.lstrip('/')}"
+            model_url = f"{ABO}/3dmodels/original/{rel_model.lstrip('/')}"
             raw_model = raw_models / uid / Path(rel_model).name
             if not download(model_url, raw_model):
                 continue
@@ -385,7 +394,13 @@ def main() -> None:
                 continue
             local_images = []
             for rel_img in image_paths_by_model.get(uid, [])[: args.views_per_object * 2]:
-                url = f"{ABO}/{rel_img.lstrip('/')}"
+                rel_img = rel_img.lstrip("/")
+                if rel_img.startswith("spins/") or rel_img.startswith("images/"):
+                    url = f"{ABO}/{rel_img}"
+                elif "/spin" in rel_img.lower() or rel_img.lower().startswith("spin"):
+                    url = f"{ABO}/spins/original/{rel_img}"
+                else:
+                    url = f"{ABO}/images/small/{rel_img}"
                 dst = raw_images / uid / Path(rel_img).name
                 if download(url, dst, retries=2):
                     local_images.append(dst)
