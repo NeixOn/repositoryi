@@ -371,7 +371,55 @@ def build_model(args):
             planes = self.triplane(latent)
             return self.decoder(planes, query)
 
-    return ChairTriplaneUDF()
+    class GlobalUDFDecoder(nn.Module):
+        def __init__(self, latent_dim: int, hidden: int, pos_freqs: int) -> None:
+            super().__init__()
+            self.pos_freqs = pos_freqs
+            pe_dim = 3 + 3 * 2 * pos_freqs
+            in_dim = latent_dim + pe_dim
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, hidden),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
+                nn.Linear(hidden, hidden),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
+                nn.Linear(hidden, hidden),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
+                nn.Linear(hidden, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, 1),
+            )
+
+        def positional_encoding(self, query):
+            if self.pos_freqs <= 0:
+                return query
+            freqs = (2.0 ** torch.arange(self.pos_freqs, device=query.device, dtype=query.dtype)) * math.pi
+            scaled = query[..., None] * freqs
+            sin = torch.sin(scaled).flatten(-2)
+            cos = torch.cos(scaled).flatten(-2)
+            return torch.cat([query, sin, cos], dim=-1)
+
+        def forward(self, latent, query):
+            pe = self.positional_encoding(query)
+            latent = latent[:, None, :].expand(-1, query.shape[1], -1)
+            raw = self.net(torch.cat([pe, latent], dim=-1))
+            return F.softplus(raw, beta=10.0)
+
+    class ChairGlobalUDF(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.encoder = ResNetEncoder(args.latent_dim, args.pretrained_encoder)
+            self.decoder = GlobalUDFDecoder(args.latent_dim, args.decoder_hidden, args.pos_freqs)
+
+        def forward(self, image, query):
+            latent = self.encoder(image)
+            return self.decoder(latent, query)
+
+    if args.architecture == "triplane":
+        return ChairTriplaneUDF()
+    return ChairGlobalUDF()
 
 
 def loss_fn(pred, target, truncation: float):
@@ -384,8 +432,11 @@ def loss_fn(pred, target, truncation: float):
     surface = torch.tensor(0.0, device=pred.device)
     if zero_mask.any():
         surface = F.smooth_l1_loss(pred[zero_mask], target[zero_mask])
-    far = 0.05 * torch.relu(pred[target > truncation * 0.95] - truncation).mean() if (target > truncation * 0.95).any() else 0.0
-    return l1 + 2.0 * surface + far, {"l1": float(l1.detach().cpu()), "surface": float(surface.detach().cpu())}
+    far_mask = target > truncation * 0.95
+    far = torch.tensor(0.0, device=pred.device)
+    if far_mask.any():
+        far = 0.05 * torch.relu(pred[far_mask] - truncation).mean()
+    return l1 + 2.0 * surface + far, {"l1": l1.detach(), "surface": surface.detach()}
 
 
 def to_cpu_tree(value):
@@ -490,19 +541,26 @@ def train(args) -> None:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 if is_xla and xm is not None:
-                    xm.optimizer_step(optimizer)
-                    torch_xla.sync()
+                    try:
+                        xm.optimizer_step(optimizer, barrier=False)
+                    except TypeError:
+                        xm.optimizer_step(optimizer)
                 else:
                     optimizer.step()
                 scheduler.step()
-                train_losses.append(float(loss.detach().cpu()))
                 if step == 1 or step % args.log_every == 0 or step == len(train_loader):
+                    if is_xla:
+                        torch_xla.sync()
+                    loss_value = float(loss.detach().cpu())
+                    l1_value = float(parts["l1"].detach().cpu())
+                    surface_value = float(parts["surface"].detach().cpu())
+                    train_losses.append(loss_value)
                     elapsed = time.time() - start
                     sec_per_step = elapsed / step
                     eta = sec_per_step * (len(train_loader) - step)
                     print(
                         f"epoch={epoch:03d}/{args.epochs} step={step:04d}/{len(train_loader)} "
-                        f"loss={train_losses[-1]:.6f} l1={parts['l1']:.6f} surf={parts['surface']:.6f} "
+                        f"loss={loss_value:.6f} l1={l1_value:.6f} surf={surface_value:.6f} "
                         f"sec/step={sec_per_step:.2f} epoch_eta_min={eta / 60:.1f}",
                         flush=True,
                     )
@@ -518,9 +576,9 @@ def train(args) -> None:
                     udf = batch["udf"].to(device)
                     pred = model(image, query)
                     loss, _ = loss_fn(pred, udf, args.truncation)
-                    val_losses.append(float(loss.detach().cpu()))
                     if is_xla:
                         torch_xla.sync()
+                    val_losses.append(float(loss.detach().cpu()))
 
             train_loss = float(np.mean(train_losses))
             val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
@@ -562,13 +620,20 @@ def predict(args) -> None:
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     saved_args = argparse.Namespace(**ckpt.get("args", {}))
-    for name in ("latent_dim", "plane_channels", "plane_size", "decoder_hidden", "pretrained_encoder"):
+    if not hasattr(args, "architecture"):
+        args.architecture = "global_udf"
+    if "architecture" not in ckpt.get("args", {}):
+        state_keys = ckpt.get("model", {}).keys()
+        args.architecture = "triplane" if any(k.startswith("triplane.") for k in state_keys) else args.architecture
+    for name in ("architecture", "latent_dim", "plane_channels", "plane_size", "decoder_hidden", "pretrained_encoder", "pos_freqs"):
         if not hasattr(args, name):
             setattr(args, name, getattr(saved_args, name))
+    args.architecture = getattr(saved_args, "architecture", args.architecture)
     args.latent_dim = getattr(saved_args, "latent_dim", args.latent_dim)
     args.plane_channels = getattr(saved_args, "plane_channels", args.plane_channels)
     args.plane_size = getattr(saved_args, "plane_size", args.plane_size)
     args.decoder_hidden = getattr(saved_args, "decoder_hidden", args.decoder_hidden)
+    args.pos_freqs = getattr(saved_args, "pos_freqs", args.pos_freqs)
     args.pretrained_encoder = False
 
     model = build_model(args).to(device)
@@ -634,10 +699,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--queries_per_item", type=int, default=8192)
     parser.add_argument("--surface_points", type=int, default=4096)
     parser.add_argument("--truncation", type=float, default=0.20)
+    parser.add_argument("--architecture", choices=("global_udf", "triplane"), default="global_udf")
     parser.add_argument("--latent_dim", type=int, default=1024)
     parser.add_argument("--plane_channels", type=int, default=32)
     parser.add_argument("--plane_size", type=int, default=64)
     parser.add_argument("--decoder_hidden", type=int, default=256)
+    parser.add_argument("--pos_freqs", type=int, default=6)
     parser.add_argument("--pretrained_encoder", action="store_true")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
