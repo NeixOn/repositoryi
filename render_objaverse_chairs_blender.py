@@ -352,7 +352,9 @@ def setup_depth_nodes(depth_dir, view_idx):
     depth_out.base_path = str(depth_dir)
     depth_out.file_slots[0].path = f"view_{view_idx:03d}_"
     depth_out.format.file_format = "OPEN_EXR"
-    depth_out.format.color_mode = "BW"
+    # Blender 4.x output-file EXR supports RGB/RGBA here, not BW. The linked
+    # depth pass is still written as depth values inside the EXR.
+    depth_out.format.color_mode = "RGB"
     tree.links.new(render_layers.outputs["Depth"], depth_out.inputs[0])
 
 
@@ -572,6 +574,62 @@ if __name__ == "__main__":
 def run(cmd: Sequence[str], *, check: bool = True) -> subprocess.CompletedProcess:
     print("+ " + " ".join(str(part) for part in cmd), flush=True)
     return subprocess.run(list(cmd), check=check)
+
+
+def run_blender(cmd: Sequence[str], *, verbose: bool = False) -> None:
+    print("+ " + " ".join(str(part) for part in cmd), flush=True)
+    if verbose:
+        subprocess.run(list(cmd), check=True)
+        return
+
+    keep_markers = (
+        "[blender]",
+        "Traceback",
+        "Error:",
+        "RuntimeError",
+        "Exception",
+        "FAILED",
+        "DONE",
+        "Blender quit",
+    )
+    skip_prefixes = (
+        "Fra:",
+        "Saved:",
+        " Time:",
+        "Color management:",
+    )
+    skip_contains = (
+        " | Scene, ViewLayer | ",
+        "Sample ",
+        "Mem:",
+    )
+
+    process = subprocess.Popen(
+        list(cmd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+
+    for raw_line in process.stdout:
+        line = raw_line.rstrip()
+        if not line:
+            continue
+        if any(marker in line for marker in keep_markers):
+            print(line, flush=True)
+            continue
+        if line.startswith(skip_prefixes):
+            continue
+        if any(marker in line for marker in skip_contains):
+            continue
+        if line.startswith(("device:", "Data are loaded", "glTF import finished")):
+            continue
+
+    returncode = process.wait()
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, list(cmd))
 
 
 def pip_install(packages: Sequence[str]) -> None:
@@ -864,6 +922,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_candidates", type=int, default=0)
     parser.add_argument("--download_processes", type=int, default=4)
     parser.add_argument("--use_gpu", action="store_true")
+    parser.add_argument("--verbose_blender", action="store_true", help="Show full Blender render logs.")
     parser.add_argument("--skip_install", action="store_true")
     parser.add_argument("--clean_output", action="store_true")
     parser.add_argument("--background", default="219,222,224", help="RGB background after alpha compositing")
@@ -957,7 +1016,7 @@ def main() -> None:
         ]
         if args.use_gpu:
             cmd.append("--use_gpu")
-        run(cmd)
+        run_blender(cmd, verbose=args.verbose_blender)
 
         sheet = finalize_dataset_outputs(output_dir, args, background)  # type: ignore[arg-type]
 
