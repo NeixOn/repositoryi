@@ -74,8 +74,14 @@ def parse_args():
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--views", type=int, default=4)
     parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument("--samples", type=int, default=64)
     parser.add_argument("--use_gpu", action="store_true")
+    parser.add_argument("--modalities", default="rgb,mask,depth,normal,camera,mesh,points")
     return parser.parse_args(argv)
+
+
+def parse_modalities(value):
+    return {part.strip().lower() for part in value.split(",") if part.strip()}
 
 
 def clean_scene():
@@ -94,10 +100,10 @@ def clean_scene():
                 collection.remove(block)
 
 
-def setup_render(resolution, use_gpu):
+def setup_render(resolution, samples, use_gpu, modalities):
     scene = bpy.context.scene
     scene.render.engine = "CYCLES"
-    scene.cycles.samples = 96
+    scene.cycles.samples = samples
     scene.cycles.use_denoising = True
     scene.cycles.max_bounces = 6
     scene.cycles.diffuse_bounces = 2
@@ -110,8 +116,8 @@ def setup_render(resolution, use_gpu):
     scene.render.image_settings.color_mode = "RGBA"
 
     view_layer = scene.view_layers[0]
-    view_layer.use_pass_z = True
-    view_layer.use_pass_normal = True
+    view_layer.use_pass_z = "depth" in modalities
+    view_layer.use_pass_normal = "normal" in modalities
 
     try:
         scene.view_settings.view_transform = "Standard"
@@ -405,7 +411,7 @@ def set_render_png_rgba():
     scene.render.film_transparent = True
 
 
-def render_rgb_mask_depth_normal(uid, view_idx, out_dir, camera):
+def render_rgb_mask_depth_normal(uid, view_idx, out_dir, camera, modalities):
     scene = bpy.context.scene
     view_layer = scene.view_layers[0]
     render_path = out_dir / "renders" / uid / f"view_{view_idx:03d}.png"
@@ -413,32 +419,37 @@ def render_rgb_mask_depth_normal(uid, view_idx, out_dir, camera):
     normal_path = out_dir / "normals" / uid / f"view_{view_idx:03d}.png"
 
     render_path.parent.mkdir(parents=True, exist_ok=True)
-    depth_dir.mkdir(parents=True, exist_ok=True)
-    normal_path.parent.mkdir(parents=True, exist_ok=True)
 
     set_render_png_rgba()
     view_layer.material_override = None
     scene.render.filepath = str(render_path)
     bpy.ops.render.render(write_still=True)
 
-    setup_depth_nodes(depth_dir, view_idx)
-    view_layer.material_override = None
-    scene.render.filepath = str(depth_dir / f"unused_{view_idx:03d}.png")
-    bpy.ops.render.render(write_still=False)
-    depth_path = find_depth_output(depth_dir, view_idx)
-    scene.use_nodes = False
+    depth_path = None
+    if "depth" in modalities:
+        depth_dir.mkdir(parents=True, exist_ok=True)
+        setup_depth_nodes(depth_dir, view_idx)
+        view_layer.material_override = None
+        scene.render.filepath = str(depth_dir / f"unused_{view_idx:03d}.png")
+        bpy.ops.render.render(write_still=False)
+        depth_path = find_depth_output(depth_dir, view_idx)
+        scene.use_nodes = False
 
-    set_render_png_rgba()
-    normal_mat = make_normal_material()
-    view_layer.material_override = normal_mat
-    scene.render.filepath = str(normal_path)
-    bpy.ops.render.render(write_still=True)
-    view_layer.material_override = None
+    if "normal" in modalities:
+        normal_path.parent.mkdir(parents=True, exist_ok=True)
+        set_render_png_rgba()
+        normal_mat = make_normal_material()
+        view_layer.material_override = normal_mat
+        scene.render.filepath = str(normal_path)
+        bpy.ops.render.render(write_still=True)
+        view_layer.material_override = None
+    else:
+        normal_path = None
 
     return render_path, depth_path, normal_path
 
 
-def render_views(camera, out_dir, uid, requested_views):
+def render_views(camera, out_dir, uid, requested_views, modalities):
     obj = bpy.data.objects["chair"]
     min_corner, max_corner, center, size, radius = object_bounds(obj)
     camera_views = build_camera_views(requested_views)
@@ -464,17 +475,18 @@ def render_views(camera, out_dir, uid, requested_views):
         bpy.context.view_layer.update()
 
         camera_path = out_dir / "cameras" / uid / f"view_{i:03d}.json"
-        save_camera_json(camera_path, uid, i, camera, bpy.context.scene, az_deg, elev_deg, camera_radius, target)
+        if "camera" in modalities:
+            save_camera_json(camera_path, uid, i, camera, bpy.context.scene, az_deg, elev_deg, camera_radius, target)
 
-        rgb_path, depth_path, normal_path = render_rgb_mask_depth_normal(uid, i, out_dir, camera)
+        rgb_path, depth_path, normal_path = render_rgb_mask_depth_normal(uid, i, out_dir, camera, modalities)
         rows.append({
             "uid": uid,
             "view": i,
             "image_path": f"renders/{uid}/view_{i:03d}.png",
-            "mask_path": f"masks/{uid}/view_{i:03d}.png",
+            "mask_path": f"masks/{uid}/view_{i:03d}.png" if "mask" in modalities else "",
             "depth_path": f"depths/{uid}/view_{i:03d}.exr" if depth_path else "",
-            "normal_path": f"normals/{uid}/view_{i:03d}.png",
-            "camera_path": f"cameras/{uid}/view_{i:03d}.json",
+            "normal_path": f"normals/{uid}/view_{i:03d}.png" if normal_path else "",
+            "camera_path": f"cameras/{uid}/view_{i:03d}.json" if "camera" in modalities else "",
             "azimuth_deg": az_deg,
             "elevation_deg": elev_deg,
             "radius": camera_radius,
@@ -487,7 +499,7 @@ def render_views(camera, out_dir, uid, requested_views):
     return rows
 
 
-def process_item(item, out_dir, requested_views):
+def process_item(item, out_dir, requested_views, modalities):
     uid = item["uid"]
     asset_path = item["path"]
     print(f"[blender] Processing {uid}: {asset_path}", flush=True)
@@ -498,7 +510,7 @@ def process_item(item, out_dir, requested_views):
     add_lights(obj)
     camera = add_camera()
     normalized_path = export_normalized(out_dir, uid)
-    view_rows = render_views(camera, out_dir, uid, requested_views)
+    view_rows = render_views(camera, out_dir, uid, requested_views, modalities)
 
     return {
         "uid": uid,
@@ -513,7 +525,8 @@ def main():
     args = parse_args()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    setup_render(args.resolution, args.use_gpu)
+    modalities = parse_modalities(args.modalities)
+    setup_render(args.resolution, args.samples, args.use_gpu, modalities)
 
     with open(args.manifest, "r", encoding="utf-8") as f:
         manifest = json.load(f)
@@ -523,7 +536,7 @@ def main():
     all_views = []
     for item in manifest:
         try:
-            result = process_item(item, out_dir, args.views)
+            result = process_item(item, out_dir, args.views, modalities)
             objects.append(result)
             all_views.extend(result["view_rows"])
         except Exception as exc:
@@ -731,19 +744,63 @@ def download_objects(uids: Sequence[str], download_processes: int) -> dict[str, 
     return {uid: str(path) for uid, path in downloaded.items() if path and Path(path).exists()}
 
 
-def composite_and_make_masks(output_dir: Path, background: tuple[int, int, int]) -> None:
+def read_existing_object_uids(output_dir: Path) -> set[str]:
+    objects_csv = output_dir / "metadata" / "objects.csv"
+    if not objects_csv.exists():
+        return set()
+    with open(objects_csv, "r", encoding="utf-8") as f:
+        return {row["uid"] for row in csv.DictReader(f) if row.get("uid")}
+
+
+def object_files_complete(output_dir: Path, uid: str, views: int, modalities: set[str]) -> bool:
+    if "mesh" in modalities and not (output_dir / "objects" / uid / "normalized.glb").exists():
+        return False
+    if "points" in modalities and not (output_dir / "objects" / uid / "points.npz").exists():
+        return False
+
+    for view_idx in range(views):
+        name = f"view_{view_idx:03d}"
+        if "rgb" in modalities and not (output_dir / "renders" / uid / f"{name}.png").exists():
+            return False
+        if "mask" in modalities and not (output_dir / "masks" / uid / f"{name}.png").exists():
+            return False
+        if "depth" in modalities and not (output_dir / "depths" / uid / f"{name}.exr").exists():
+            return False
+        if "normal" in modalities and not (output_dir / "normals" / uid / f"{name}.png").exists():
+            return False
+        if "camera" in modalities and not (output_dir / "cameras" / uid / f"{name}.json").exists():
+            return False
+    return True
+
+
+def filter_resume_uids(output_dir: Path, uids: Sequence[str], views: int, modalities: set[str]) -> list[str]:
+    accepted = read_existing_object_uids(output_dir)
+    remaining = []
+    skipped = 0
+    for uid in uids:
+        if uid in accepted or object_files_complete(output_dir, uid, views, modalities):
+            skipped += 1
+            continue
+        remaining.append(uid)
+    if skipped:
+        print(f"Resume: skipped {skipped} already completed objects.", flush=True)
+    return remaining
+
+
+def composite_and_make_masks(output_dir: Path, background: tuple[int, int, int], modalities: set[str]) -> None:
     from PIL import Image
 
     for path in (output_dir / "renders").glob("*/*.png"):
         uid = path.parent.name
-        mask_dir = output_dir / "masks" / uid
-        mask_dir.mkdir(parents=True, exist_ok=True)
-        mask_path = mask_dir / path.name
 
         img = Image.open(path).convert("RGBA")
         alpha = img.getchannel("A")
-        mask = alpha.point(lambda value: 255 if value > 8 else 0)
-        mask.save(mask_path)
+        if "mask" in modalities:
+            mask_dir = output_dir / "masks" / uid
+            mask_dir.mkdir(parents=True, exist_ok=True)
+            mask_path = mask_dir / path.name
+            mask = alpha.point(lambda value: 255 if value > 8 else 0)
+            mask.save(mask_path)
 
         bg = Image.new("RGBA", img.size, (*background, 255))
         composed = Image.alpha_composite(bg, img).convert("RGB")
@@ -830,7 +887,7 @@ def write_dataset_info(output_dir: Path, args: argparse.Namespace) -> None:
         "resolution": args.resolution,
         "requested_views": args.views,
         "points_per_object": args.points,
-        "modalities": ["rgb", "mask", "depth", "normal", "camera", "mesh", "surface_points"],
+        "modalities": [part.strip() for part in args.modalities.split(",") if part.strip()],
     }
     with open(output_dir / "metadata" / "dataset_info.json", "w", encoding="utf-8") as f:
         json.dump(info, f, indent=2)
@@ -929,9 +986,10 @@ def publish_kaggle_dataset(output_dir: Path, args: argparse.Namespace, message: 
     print("Kaggle Dataset create upload started.", flush=True)
 
 
-def finalize_dataset_outputs(output_dir: Path, args: argparse.Namespace, background: tuple[int, int, int]) -> Path | None:
-    composite_and_make_masks(output_dir, background)  # type: ignore[arg-type]
-    create_points_npz(output_dir, args.points, args.seed)
+def finalize_dataset_outputs(output_dir: Path, args: argparse.Namespace, background: tuple[int, int, int], modalities: set[str]) -> Path | None:
+    composite_and_make_masks(output_dir, background, modalities)  # type: ignore[arg-type]
+    if "points" in modalities:
+        create_points_npz(output_dir, args.points, args.seed)
     make_splits(output_dir, args.train_ratio, args.val_ratio, args.seed)
     write_dataset_info(output_dir, args)
     return make_contact_sheet(output_dir)
@@ -947,7 +1005,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_objects", type=int, default=10)
     parser.add_argument("--views", type=int, default=4)
     parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument("--samples", type=int, default=64)
     parser.add_argument("--points", type=int, default=32768)
+    parser.add_argument(
+        "--modalities",
+        default="rgb,mask,depth,normal,camera,mesh,points",
+        help=(
+            "Comma-separated outputs. Use rgb,mask,camera,mesh,points for a much faster "
+            "dataset without depth/normal auxiliary renders."
+        ),
+    )
     parser.add_argument("--categories", default=",".join(DEFAULT_CATEGORIES))
     parser.add_argument("--max_candidates", type=int, default=0)
     parser.add_argument("--download_processes", type=int, default=4)
@@ -979,6 +1046,11 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
     cache_dir = Path(args.cache_dir)
+    modalities = {part.strip().lower() for part in args.modalities.split(",") if part.strip()}
+    if "rgb" not in modalities:
+        modalities.add("rgb")
+    if "mesh" not in modalities:
+        modalities.add("mesh")
 
     if args.clean_output and output_dir.exists():
         shutil.rmtree(output_dir)
@@ -1002,6 +1074,12 @@ def main() -> None:
         raise RuntimeError("No chair-like candidates were found")
 
     target_uids = candidates[: args.num_objects]
+    target_uids = filter_resume_uids(output_dir, target_uids, args.views, modalities)
+    if not target_uids:
+        print("Nothing to render: requested objects are already present.", flush=True)
+        finalize_dataset_outputs(output_dir, args, background=tuple(int(part.strip()) for part in args.background.split(",")), modalities=modalities)  # type: ignore[arg-type]
+        return
+
     downloaded = download_objects(target_uids, args.download_processes)
     manifest = [{"uid": uid, "path": downloaded[uid]} for uid in target_uids if uid in downloaded]
     if not manifest:
@@ -1043,12 +1121,16 @@ def main() -> None:
             str(args.views),
             "--resolution",
             str(args.resolution),
+            "--samples",
+            str(args.samples),
+            "--modalities",
+            ",".join(sorted(modalities)),
         ]
         if args.use_gpu:
             cmd.append("--use_gpu")
         run_blender(cmd, verbose=args.verbose_blender)
 
-        sheet = finalize_dataset_outputs(output_dir, args, background)  # type: ignore[arg-type]
+        sheet = finalize_dataset_outputs(output_dir, args, background, modalities)  # type: ignore[arg-type]
 
         if args.publish_to_kaggle:
             objects_csv = output_dir / "metadata" / "objects.csv"
