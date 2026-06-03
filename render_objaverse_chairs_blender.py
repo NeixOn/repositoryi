@@ -655,7 +655,37 @@ def ensure_blender(args: argparse.Namespace) -> str:
     if not extracted.exists():
         if not archive_path.exists():
             print(f"Downloading Blender 4.1.1 to {archive_path}", flush=True)
-            urllib.request.urlretrieve(DEFAULT_BLENDER_URL, archive_path)
+            wget = shutil.which("wget")
+            curl = shutil.which("curl")
+            if wget:
+                run(
+                    [
+                        wget,
+                        "--user-agent=Mozilla/5.0",
+                        "-O",
+                        str(archive_path),
+                        DEFAULT_BLENDER_URL,
+                    ]
+                )
+            elif curl:
+                run(
+                    [
+                        curl,
+                        "-L",
+                        "-A",
+                        "Mozilla/5.0",
+                        "-o",
+                        str(archive_path),
+                        DEFAULT_BLENDER_URL,
+                    ]
+                )
+            else:
+                request = urllib.request.Request(
+                    DEFAULT_BLENDER_URL,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                with urllib.request.urlopen(request) as response, open(archive_path, "wb") as f:
+                    shutil.copyfileobj(response, f)
         print(f"Extracting Blender to {install_dir}", flush=True)
         with tarfile.open(archive_path, "r:xz") as tar:
             tar.extractall(install_dir)
