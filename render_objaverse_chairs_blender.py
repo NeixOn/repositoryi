@@ -58,6 +58,7 @@ import json
 import math
 import shutil
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -534,7 +535,11 @@ def main():
     objects = []
     failed = []
     all_views = []
-    for item in manifest:
+    chunk_start = time.time()
+    total_items = len(manifest)
+    for item_idx, item in enumerate(manifest, start=1):
+        item_start = time.time()
+        print(f"[blender] Progress object {item_idx}/{total_items}: {item.get('uid')}", flush=True)
         try:
             result = process_item(item, out_dir, args.views, modalities)
             objects.append(result)
@@ -542,6 +547,18 @@ def main():
         except Exception as exc:
             traceback.print_exc()
             failed.append({"uid": item.get("uid"), "asset_path": item.get("path"), "error": repr(exc)})
+        finally:
+            item_sec = time.time() - item_start
+            elapsed = time.time() - chunk_start
+            avg_sec = elapsed / item_idx
+            remaining = max(total_items - item_idx, 0)
+            eta_sec = remaining * avg_sec
+            print(
+                "[blender] Object timing "
+                f"{item_idx}/{total_items}: current={item_sec:.1f}s "
+                f"avg={avg_sec:.1f}s eta_min={eta_sec / 60.0:.1f}",
+                flush=True,
+            )
 
     metadata_dir = out_dir / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
