@@ -496,8 +496,6 @@ def render_views(camera, out_dir, uid, requested_views, modalities):
             "target_y": target.y,
             "target_z": target.z,
         })
-        print("[blender] rendered", rgb_path, flush=True)
-
     return rows
 
 
