@@ -78,6 +78,7 @@ def parse_args():
     parser.add_argument("--samples", type=int, default=64)
     parser.add_argument("--use_gpu", action="store_true")
     parser.add_argument("--modalities", default="rgb,mask,depth,normal,camera,mesh,points")
+    parser.add_argument("--preview_every_objects", type=int, default=0)
     return parser.parse_args(argv)
 
 
@@ -544,6 +545,9 @@ def main():
             result = process_item(item, out_dir, args.views, modalities)
             objects.append(result)
             all_views.extend(result["view_rows"])
+            if args.preview_every_objects > 0 and item_idx % args.preview_every_objects == 0:
+                preview_path = out_dir / "renders" / result["uid"] / "view_000.png"
+                print(f"[blender] Preview sample {item_idx}/{total_items}: {preview_path}", flush=True)
         except Exception as exc:
             traceback.print_exc()
             failed.append({"uid": item.get("uid"), "asset_path": item.get("path"), "error": repr(exc)})
@@ -942,6 +946,44 @@ def make_contact_sheet(output_dir: Path, max_objects: int = 64) -> Path | None:
     return out_path
 
 
+def make_stride_preview_sheet(output_dir: Path, stride: int = 10, max_objects: int = 80) -> Path | None:
+    from PIL import Image, ImageDraw
+
+    if stride <= 0:
+        return None
+    objects_csv = output_dir / "metadata" / "objects.csv"
+    if not objects_csv.exists():
+        return None
+    with open(objects_csv, "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    sampled = [row for idx, row in enumerate(rows, start=1) if idx == 1 or idx % stride == 0][:max_objects]
+
+    thumbs = []
+    for idx, row in enumerate(sampled, start=1):
+        uid = row["uid"]
+        image_path = output_dir / "renders" / uid / "view_000.png"
+        if not image_path.exists():
+            continue
+        img = Image.open(image_path).convert("RGB")
+        img.thumbnail((220, 220), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (240, 286), (238, 238, 238))
+        canvas.paste(img, ((240 - img.width) // 2, 8))
+        draw = ImageDraw.Draw(canvas)
+        draw.text((8, 236), f"sample {idx}", fill=(30, 30, 30))
+        draw.text((8, 258), uid[:18], fill=(30, 30, 30))
+        thumbs.append(canvas)
+    if not thumbs:
+        return None
+    cols = min(5, len(thumbs))
+    rows_count = (len(thumbs) + cols - 1) // cols
+    sheet = Image.new("RGB", (cols * 240, rows_count * 286), (245, 245, 245))
+    for idx, thumb in enumerate(thumbs):
+        sheet.paste(thumb, ((idx % cols) * 240, (idx // cols) * 286))
+    out_path = output_dir / f"preview_every_{stride}.jpg"
+    sheet.save(out_path, quality=95)
+    return out_path
+
+
 def iter_chunks(items: Sequence[dict[str, str]], chunk_size: int) -> Iterable[list[dict[str, str]]]:
     for start in range(0, len(items), chunk_size):
         yield list(items[start : start + chunk_size])
@@ -1009,7 +1051,9 @@ def finalize_dataset_outputs(output_dir: Path, args: argparse.Namespace, backgro
         create_points_npz(output_dir, args.points, args.seed)
     make_splits(output_dir, args.train_ratio, args.val_ratio, args.seed)
     write_dataset_info(output_dir, args)
-    return make_contact_sheet(output_dir)
+    sheet = make_contact_sheet(output_dir)
+    stride_sheet = make_stride_preview_sheet(output_dir, args.preview_every_objects)
+    return stride_sheet or sheet
 
 
 def parse_args() -> argparse.Namespace:
@@ -1037,6 +1081,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--download_processes", type=int, default=4)
     parser.add_argument("--use_gpu", action="store_true")
     parser.add_argument("--verbose_blender", action="store_true", help="Show full Blender render logs.")
+    parser.add_argument(
+        "--preview_every_objects",
+        type=int,
+        default=10,
+        help="Create preview_every_N.jpg with view_000 from every N-th accepted object.",
+    )
     parser.add_argument("--skip_install", action="store_true")
     parser.add_argument("--clean_output", action="store_true")
     parser.add_argument("--background", default="219,222,224", help="RGB background after alpha compositing")
@@ -1142,12 +1192,16 @@ def main() -> None:
             str(args.samples),
             "--modalities",
             ",".join(sorted(modalities)),
+            "--preview_every_objects",
+            str(args.preview_every_objects),
         ]
         if args.use_gpu:
             cmd.append("--use_gpu")
         run_blender(cmd, verbose=args.verbose_blender)
 
         sheet = finalize_dataset_outputs(output_dir, args, background, modalities)  # type: ignore[arg-type]
+        if sheet:
+            print(f"Preview sheet updated: {sheet}", flush=True)
 
         if args.publish_to_kaggle:
             objects_csv = output_dir / "metadata" / "objects.csv"
