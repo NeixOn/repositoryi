@@ -78,7 +78,8 @@ def read_dataset(dataset_root: Path, exclude_uids: set[str]) -> Dict[str, List[d
             mask_path = dataset_root / row.get("mask_path", f"masks/{uid}/view_{view:03d}.png")
             camera_path = dataset_root / row.get("camera_path", f"cameras/{uid}/view_{view:03d}.json")
             mesh_path = dataset_root / "objects" / uid / "normalized.glb"
-            if image_path.exists() and mask_path.exists() and camera_path.exists() and mesh_path.exists():
+            points_path = dataset_root / "objects" / uid / "points.npz"
+            if image_path.exists() and mask_path.exists() and camera_path.exists() and mesh_path.exists() and points_path.exists():
                 grouped[uid].append(
                     {
                         "uid": uid,
@@ -87,6 +88,7 @@ def read_dataset(dataset_root: Path, exclude_uids: set[str]) -> Dict[str, List[d
                         "mask_path": str(mask_path),
                         "camera_path": str(camera_path),
                         "mesh_path": str(mesh_path),
+                        "points_path": str(points_path),
                     }
                 )
     grouped = {uid: sorted(rows, key=lambda x: x["view"]) for uid, rows in grouped.items() if len(rows) >= 2}
@@ -177,6 +179,42 @@ def camera_rays(camera_json: str, xs: np.ndarray, ys: np.ndarray):
     return origins.astype(np.float32), dirs_world.astype(np.float32)
 
 
+def sample_geometry_queries(points_path: str, rng, count: int):
+    data = np.load(points_path)
+    surface = np.asarray(data["points"], dtype=np.float32)
+    if len(surface) == 0:
+        raise RuntimeError(f"Empty points file: {points_path}")
+
+    n_surface = count // 3
+    n_near = count // 3
+    n_uniform = count - n_surface - n_near
+
+    surface_idx = rng.choice(len(surface), n_surface, replace=len(surface) < n_surface)
+    surface_pts = surface[surface_idx]
+    surface_target = np.ones((n_surface, 1), dtype=np.float32)
+
+    near_idx = rng.choice(len(surface), n_near, replace=len(surface) < n_near)
+    near_sigma = rng.choice(
+        np.array([0.015, 0.035, 0.07], dtype=np.float32),
+        size=n_near,
+        p=[0.45, 0.35, 0.20],
+    )
+    near_pts = surface[near_idx] + rng.normal(size=(n_near, 3)).astype(np.float32) * near_sigma[:, None]
+    near_dist = np.linalg.norm(near_pts - surface[near_idx], axis=1, keepdims=True)
+    near_target = np.exp(-near_dist / 0.045).astype(np.float32)
+
+    uniform_pts = np.empty((n_uniform, 3), dtype=np.float32)
+    uniform_pts[:, 0] = rng.uniform(BOX_MIN[0], BOX_MAX[0], size=n_uniform)
+    uniform_pts[:, 1] = rng.uniform(BOX_MIN[1], BOX_MAX[1], size=n_uniform)
+    uniform_pts[:, 2] = rng.uniform(BOX_MIN[2], BOX_MAX[2], size=n_uniform)
+    uniform_target = np.zeros((n_uniform, 1), dtype=np.float32)
+
+    query = np.concatenate([surface_pts, near_pts, uniform_pts], axis=0)
+    target = np.concatenate([surface_target, near_target, uniform_target], axis=0)
+    order = rng.permutation(len(query))
+    return query[order].astype(np.float32), target[order].astype(np.float32)
+
+
 class RenderPairDataset:
     def __init__(self, grouped, uids, args, training: bool):
         self.grouped = grouped
@@ -230,6 +268,7 @@ class RenderPairDataset:
         rays_o, rays_d = camera_rays(target["camera_path"], xs, ys)
         rgb_patch = target_rgb[yy, xx].reshape(-1, 3).astype(np.float32)
         mask_patch = target_mask[yy, xx].reshape(-1, 1).astype(np.float32)
+        geo_query, geo_target = sample_geometry_queries(target["points_path"], rng, self.args.geometry_queries)
 
         return {
             "uid": uid,
@@ -238,6 +277,8 @@ class RenderPairDataset:
             "rays_d": rays_d,
             "target_rgb": rgb_patch,
             "target_mask": mask_patch,
+            "geo_query": geo_query,
+            "geo_target": geo_target,
         }
 
 
@@ -245,7 +286,7 @@ def collate_batch(batch):
     import torch
 
     out = {}
-    for key in ("source_image", "rays_o", "rays_d", "target_rgb", "target_mask"):
+    for key in ("source_image", "rays_o", "rays_d", "target_rgb", "target_mask", "geo_query", "geo_target"):
         out[key] = torch.from_numpy(np.stack([item[key] for item in batch], axis=0))
     out["uid"] = [item["uid"] for item in batch]
     return out
@@ -431,6 +472,20 @@ def render_losses(pred_rgb, pred_mask, pred_depth, weights, target_rgb, target_m
     }
 
 
+def geometry_density_loss(model, planes, geo_query, geo_target):
+    import torch
+    import torch.nn.functional as F
+
+    _, sigma = model.decoder(planes, geo_query)
+    pred = 1.0 - torch.exp(-sigma * 0.08)
+    bce = F.binary_cross_entropy(pred.float().clamp(1e-4, 1.0 - 1e-4), geo_target.float())
+    surface = pred[geo_target > 0.95]
+    empty = pred[geo_target < 0.05]
+    surface_loss = (1.0 - surface).abs().mean() if surface.numel() else bce * 0.0
+    empty_loss = empty.abs().mean() if empty.numel() else bce * 0.0
+    return bce + 0.25 * surface_loss + 0.25 * empty_loss
+
+
 def set_encoder_trainable(model, trainable: bool):
     module = model.module if hasattr(model, "module") else model
     for p in module.encoder.backbone.parameters():
@@ -575,10 +630,13 @@ def train(args):
             rays_d = batch["rays_d"].to(device, non_blocking=True)
             target_rgb = batch["target_rgb"].to(device, non_blocking=True)
             target_mask = batch["target_mask"].to(device, non_blocking=True)
+            geo_query = batch["geo_query"].to(device, non_blocking=True)
+            geo_target = batch["geo_target"].to(device, non_blocking=True)
 
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=(args.amp != "none" and device.type == "cuda")):
                 planes = model(source)
-                pred_rgb, pred_mask, pred_depth, weights = render_rays(model.module if hasattr(model, "module") else model, planes, rays_o, rays_d, args, training=True)
+                module = model.module if hasattr(model, "module") else model
+                pred_rgb, pred_mask, pred_depth, weights = render_rays(module, planes, rays_o, rays_d, args, training=True)
             loss, parts = render_losses(
                 pred_rgb.float(),
                 pred_mask.float(),
@@ -588,6 +646,9 @@ def train(args):
                 target_mask.float(),
                 args,
             )
+            geo_loss = geometry_density_loss(module, planes.float(), geo_query.float(), geo_target.float())
+            loss = loss + args.geometry_weight * geo_loss
+            parts["geo"] = geo_loss.detach()
             loss = loss / args.grad_accum
 
             scaler.scale(loss).backward()
@@ -611,6 +672,7 @@ def train(args):
                     f"loss={np.mean(train_losses[-args.log_every:]):.6f} "
                     f"rgb={np.mean(train_parts['rgb'][-args.log_every:]):.5f} "
                     f"mask={np.mean(train_parts['mask'][-args.log_every:]):.5f} "
+                    f"geo={np.mean(train_parts['geo'][-args.log_every:]):.5f} "
                     f"sec/step={sec:.3f} eta_min={eta:.1f}",
                     flush=True,
                 )
@@ -629,6 +691,8 @@ def train(args):
                 rays_d = batch["rays_d"].to(device, non_blocking=True)
                 target_rgb = batch["target_rgb"].to(device, non_blocking=True)
                 target_mask = batch["target_mask"].to(device, non_blocking=True)
+                geo_query = batch["geo_query"].to(device, non_blocking=True)
+                geo_target = batch["geo_target"].to(device, non_blocking=True)
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=(args.amp != "none" and device.type == "cuda")):
                     planes = model(source)
                     module = model.module if hasattr(model, "module") else model
@@ -642,6 +706,8 @@ def train(args):
                     target_mask.float(),
                     args,
                 )
+                geo_loss = geometry_density_loss(module, planes.float(), geo_query.float(), geo_target.float())
+                loss = loss + args.geometry_weight * geo_loss
                 val_losses.append(float(loss.detach().cpu()))
 
         train_loss = float(np.mean(train_losses)) if train_losses else float("inf")
@@ -731,6 +797,7 @@ def parse_args():
     p.add_argument("--grad_accum", type=int, default=8)
     p.add_argument("--patch_size", type=int, default=32)
     p.add_argument("--samples_per_ray", type=int, default=64)
+    p.add_argument("--geometry_queries", type=int, default=4096)
     p.add_argument("--near", type=float, default=2.0)
     p.add_argument("--far", type=float, default=7.0)
     p.add_argument("--ray_jitter", action="store_true", default=True)
@@ -750,6 +817,7 @@ def parse_args():
     p.add_argument("--mask_weight", type=float, default=0.35)
     p.add_argument("--opacity_weight", type=float, default=0.04)
     p.add_argument("--distortion_weight", type=float, default=0.002)
+    p.add_argument("--geometry_weight", type=float, default=0.08)
     p.add_argument("--charbonnier_eps", type=float, default=1e-3)
     p.add_argument("--background", type=float, nargs=3, default=(219 / 255.0, 222 / 255.0, 224 / 255.0))
     p.add_argument("--amp", choices=("none", "fp16", "bf16"), default="bf16")
