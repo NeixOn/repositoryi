@@ -579,8 +579,16 @@ def train(args):
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=(args.amp != "none" and device.type == "cuda")):
                 planes = model(source)
                 pred_rgb, pred_mask, pred_depth, weights = render_rays(model.module if hasattr(model, "module") else model, planes, rays_o, rays_d, args, training=True)
-                loss, parts = render_losses(pred_rgb, pred_mask, pred_depth, weights, target_rgb, target_mask, args)
-                loss = loss / args.grad_accum
+            loss, parts = render_losses(
+                pred_rgb.float(),
+                pred_mask.float(),
+                pred_depth.float(),
+                weights.float(),
+                target_rgb.float(),
+                target_mask.float(),
+                args,
+            )
+            loss = loss / args.grad_accum
 
             scaler.scale(loss).backward()
             if step % args.grad_accum == 0:
@@ -625,7 +633,15 @@ def train(args):
                     planes = model(source)
                     module = model.module if hasattr(model, "module") else model
                     pred_rgb, pred_mask, pred_depth, weights = render_rays(module, planes, rays_o, rays_d, args, training=False)
-                    loss, _ = render_losses(pred_rgb, pred_mask, pred_depth, weights, target_rgb, target_mask, args)
+                loss, _ = render_losses(
+                    pred_rgb.float(),
+                    pred_mask.float(),
+                    pred_depth.float(),
+                    weights.float(),
+                    target_rgb.float(),
+                    target_mask.float(),
+                    args,
+                )
                 val_losses.append(float(loss.detach().cpu()))
 
         train_loss = float(np.mean(train_losses)) if train_losses else float("inf")
