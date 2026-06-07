@@ -109,26 +109,18 @@ def load_mesh_arrays(mesh_path: Path):
     import trimesh
 
     loaded = trimesh.load(mesh_path, force="scene")
-    meshes = []
     if isinstance(loaded, trimesh.Scene):
-        for geom in loaded.geometry.values():
-            if isinstance(geom, trimesh.Trimesh) and len(geom.vertices) and len(geom.faces):
-                meshes.append(geom)
+        # Important: GLB files often store transforms in the scene graph.
+        # Using loaded.geometry directly ignores those transforms and produces
+        # shifted/scaled/flipped masks. dump(concatenate=True) bakes transforms.
+        mesh = loaded.dump(concatenate=True)
     elif isinstance(loaded, trimesh.Trimesh):
-        meshes.append(loaded)
-    if not meshes:
+        mesh = loaded
+    else:
+        mesh = None
+    if mesh is None or not isinstance(mesh, trimesh.Trimesh) or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
         raise RuntimeError(f"No mesh geometry in {mesh_path}")
-
-    vertices = []
-    faces = []
-    offset = 0
-    for mesh in meshes:
-        v = np.asarray(mesh.vertices, dtype=np.float32)
-        f = np.asarray(mesh.faces, dtype=np.int64)
-        vertices.append(v)
-        faces.append(f + offset)
-        offset += len(v)
-    return np.concatenate(vertices, axis=0), np.concatenate(faces, axis=0)
+    return np.asarray(mesh.vertices, dtype=np.float32), np.asarray(mesh.faces, dtype=np.int64)
 
 
 def project_vertices(vertices, camera_path: Path):
