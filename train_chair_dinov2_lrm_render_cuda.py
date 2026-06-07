@@ -370,6 +370,7 @@ def build_model(args):
             self.net = nn.Sequential(*layers)
             self.sigma = nn.Linear(dim, 1)
             self.rgb = nn.Linear(dim, 3)
+            nn.init.constant_(self.sigma.bias, args.sigma_init_bias)
 
         def sample_planes(self, planes, pts):
             b, _, c, _, _ = planes.shape
@@ -391,7 +392,7 @@ def build_model(args):
 
         def forward(self, planes, pts):
             h = self.net(self.sample_planes(planes, pts))
-            sigma = F.softplus(self.sigma(h) - 1.0)
+            sigma = F.softplus(self.sigma(h) + args.sigma_activation_bias)
             rgb = torch.sigmoid(self.rgb(h))
             return rgb, sigma
 
@@ -461,6 +462,8 @@ def render_losses(pred_rgb, pred_mask, pred_depth, weights, target_rgb, target_m
     inter = (pred_mask * target_mask).sum(dim=1)
     dice = 1.0 - (2.0 * inter + 1.0) / (pred_mask.sum(dim=1) + target_mask.sum(dim=1) + 1.0)
     mask_loss = bce + dice.mean()
+    fg_denom = target_mask.sum(dim=1).clamp_min(1.0)
+    fg_recall_loss = (((1.0 - pred_mask).clamp_min(0.0) * target_mask).sum(dim=1) / fg_denom).mean()
 
     opacity_loss = (pred_mask * (1.0 - target_mask)).mean()
     weights_sum = weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -471,10 +474,17 @@ def render_losses(pred_rgb, pred_mask, pred_depth, weights, target_rgb, target_m
     mask_weight = args.mask_weight * stage.get("mask", 1.0)
     opacity_weight = args.opacity_weight * stage.get("opacity", 1.0)
     distortion_weight = args.distortion_weight * stage.get("distortion", 1.0)
-    total = rgb_loss + mask_weight * mask_loss + opacity_weight * opacity_loss + distortion_weight * distortion
+    total = (
+        rgb_loss
+        + mask_weight * mask_loss
+        + args.mask_recall_weight * stage.get("mask", 1.0) * fg_recall_loss
+        + opacity_weight * opacity_loss
+        + distortion_weight * distortion
+    )
     return total, {
         "rgb": rgb_loss.detach(),
         "mask": mask_loss.detach(),
+        "recall": fg_recall_loss.detach(),
         "opacity": opacity_loss.detach(),
         "distortion": distortion.detach(),
     }
@@ -843,6 +853,7 @@ def train(args):
                     f"loss={np.mean(train_losses[-args.log_every:]):.6f} "
                     f"rgb={np.mean(train_parts['rgb'][-args.log_every:]):.5f} "
                     f"mask={np.mean(train_parts['mask'][-args.log_every:]):.5f} "
+                    f"recall={np.mean(train_parts['recall'][-args.log_every:]):.5f} "
                     f"geo={np.mean(train_parts['geo'][-args.log_every:]):.5f} "
                     f"perc={np.mean(train_parts['perc'][-args.log_every:]):.5f} "
                     f"sec/step={sec:.3f} eta_min={eta:.1f}",
@@ -892,11 +903,13 @@ def train(args):
             epoch_min = (time.time() - start) / 60.0
             epoch_rgb = float(np.mean(train_parts["rgb"])) if train_parts["rgb"] else 0.0
             epoch_mask = float(np.mean(train_parts["mask"])) if train_parts["mask"] else 0.0
+            epoch_recall = float(np.mean(train_parts["recall"])) if train_parts["recall"] else 0.0
             epoch_geo = float(np.mean(train_parts["geo"])) if train_parts["geo"] else 0.0
             epoch_perc = float(np.mean(train_parts["perc"])) if train_parts["perc"] else 0.0
             print(
                 f"epoch={epoch:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f} "
-                f"rgb={epoch_rgb:.5f} mask={epoch_mask:.5f} geo={epoch_geo:.5f} perc={epoch_perc:.5f} "
+                f"rgb={epoch_rgb:.5f} mask={epoch_mask:.5f} recall={epoch_recall:.5f} "
+                f"geo={epoch_geo:.5f} perc={epoch_perc:.5f} "
                 f"epoch_min={epoch_min:.1f}",
                 flush=True,
             )
@@ -904,7 +917,17 @@ def train(args):
             with open(work_dir / "train_log.csv", "a", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(
                     f,
-                    fieldnames=["epoch", "train_loss", "val_loss", "train_rgb", "train_mask", "train_geo", "train_perc", "epoch_min"],
+                    fieldnames=[
+                        "epoch",
+                        "train_loss",
+                        "val_loss",
+                        "train_rgb",
+                        "train_mask",
+                        "train_recall",
+                        "train_geo",
+                        "train_perc",
+                        "epoch_min",
+                    ],
                 )
                 if f.tell() == 0:
                     writer.writeheader()
@@ -915,6 +938,7 @@ def train(args):
                         "val_loss": val_loss,
                         "train_rgb": epoch_rgb,
                         "train_mask": epoch_mask,
+                        "train_recall": epoch_recall,
                         "train_geo": epoch_geo,
                         "train_perc": epoch_perc,
                         "epoch_min": epoch_min,
@@ -1016,6 +1040,7 @@ def parse_args():
     p.add_argument("--unfreeze_encoder_epoch", type=int, default=20)
     p.add_argument("--foreground_rgb_weight", type=float, default=4.0)
     p.add_argument("--mask_weight", type=float, default=0.35)
+    p.add_argument("--mask_recall_weight", type=float, default=0.0)
     p.add_argument("--opacity_weight", type=float, default=0.04)
     p.add_argument("--distortion_weight", type=float, default=0.002)
     p.add_argument("--geometry_weight", type=float, default=0.08)
@@ -1024,6 +1049,8 @@ def parse_args():
     p.add_argument("--warmup_mask_mult", type=float, default=1.6)
     p.add_argument("--warmup_opacity_mult", type=float, default=1.5)
     p.add_argument("--warmup_geometry_mult", type=float, default=1.8)
+    p.add_argument("--sigma_init_bias", type=float, default=0.5)
+    p.add_argument("--sigma_activation_bias", type=float, default=0.0)
     p.add_argument("--charbonnier_eps", type=float, default=1e-3)
     p.add_argument("--background", type=float, nargs=3, default=(219 / 255.0, 222 / 255.0, 224 / 255.0))
     p.add_argument("--amp", choices=("none", "fp16", "bf16"), default="bf16")
