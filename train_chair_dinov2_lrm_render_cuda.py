@@ -230,6 +230,8 @@ class RenderPairDataset:
         return len(self.items)
 
     def _choose_source(self, rng, rows, target_idx):
+        if self.training and rng.random() < self.args.same_view_prob:
+            return target_idx
         choices = [i for i in range(len(rows)) if i != target_idx]
         if not choices:
             return target_idx
@@ -256,7 +258,7 @@ class RenderPairDataset:
         rng = np.random.default_rng(seed)
         rows = self.grouped[uid]
         source_idx = self._choose_source(rng, rows, target_idx) if self.training else 0
-        if source_idx == target_idx and len(rows) > 1:
+        if source_idx == target_idx and len(rows) > 1 and not self.training:
             source_idx = 1
         source = rows[source_idx]
         target = rows[target_idx]
@@ -1001,6 +1003,7 @@ def parse_args():
     p.add_argument("--ray_jitter", action="store_true", default=True)
     p.add_argument("--no_ray_jitter", action="store_false", dest="ray_jitter")
     p.add_argument("--foreground_patch_prob", type=float, default=0.75)
+    p.add_argument("--same_view_prob", type=float, default=0.0)
     p.add_argument("--plane_size", type=int, default=128)
     p.add_argument("--plane_channels", type=int, default=48)
     p.add_argument("--decoder_hidden", type=int, default=384)
