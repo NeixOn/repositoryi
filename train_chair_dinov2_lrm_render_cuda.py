@@ -630,7 +630,7 @@ def save_validation_preview(model, grouped, val_uids, args, work_dir: Path, epoc
     if len(rows) < 2:
         return
     source = rows[0]
-    target = rows[1]
+    target = rows[0] if args.preview_same_view else rows[1]
 
     source_np = load_source_image(source["image_path"], source["mask_path"], args.image_size, args.crop)
     target_rgb, target_mask = load_rgb_mask(target["image_path"], target["mask_path"])
@@ -1067,6 +1067,7 @@ def parse_args():
     p.add_argument("--preview_every", type=int, default=1)
     p.add_argument("--preview_size", type=int, default=128)
     p.add_argument("--preview_ray_chunk", type=int, default=4096)
+    p.add_argument("--preview_same_view", action="store_true")
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
