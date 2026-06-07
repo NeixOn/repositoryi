@@ -34,8 +34,10 @@ DEFAULT_BLENDER_URL = "https://download.blender.org/release/Blender4.1/blender-4
 
 BLENDER_MASK_WORKER = r'''
 import argparse
+import contextlib
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -55,7 +57,26 @@ def parse_args():
     p.add_argument("--dataset_root", required=True)
     p.add_argument("--resolution", type=int, default=0)
     p.add_argument("--engine", choices=("eevee", "workbench"), default="eevee")
+    p.add_argument("--worker_id", default="0")
     return p.parse_args(argv)
+
+
+@contextlib.contextmanager
+def suppress_native_output():
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_stdout = os.dup(1)
+    saved_stderr = os.dup(2)
+    try:
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), 1)
+            os.dup2(devnull.fileno(), 2)
+        yield
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.dup2(saved_stderr, 2)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
 
 
 def clear_scene():
@@ -110,7 +131,8 @@ def make_mask_material():
 
 
 def import_mesh(mesh_path):
-    bpy.ops.import_scene.gltf(filepath=str(mesh_path))
+    with suppress_native_output():
+        bpy.ops.import_scene.gltf(filepath=str(mesh_path))
     meshes = [obj for obj in bpy.context.scene.objects if obj.type == "MESH"]
     if not meshes:
         raise RuntimeError(f"No mesh objects in {mesh_path}")
@@ -163,7 +185,8 @@ def render_object_views(mesh_path, views, dataset_root, uid, resolution_override
         out_path = out_dir / f"view_{view:03d}.png"
         configure_camera_from_json(camera, camera_json, resolution_override)
         bpy.context.scene.render.filepath = str(out_path)
-        bpy.ops.render.render(write_still=True)
+        with suppress_native_output():
+            bpy.ops.render.render(write_still=True)
 
 
 def main():
@@ -184,12 +207,12 @@ def main():
         sec_per_view = elapsed / max(done, 1)
         eta = sec_per_view * max(total - done, 0) / 60.0
         print(
-            f"[mask] object={obj_idx}/{len(items)} uid={uid} views={len(item['views'])} "
+            f"[mask:w{args.worker_id}] object={obj_idx}/{len(items)} uid={uid} views={len(item['views'])} "
             f"obj_sec={time.time() - obj_start:.2f} sec/view={sec_per_view:.3f} eta_min={eta:.1f}",
             flush=True,
         )
 
-    print(f"[mask] complete views={done} elapsed_min={(time.time() - start) / 60.0:.1f}", flush=True)
+    print(f"[mask:w{args.worker_id}] complete views={done} elapsed_min={(time.time() - start) / 60.0:.1f}", flush=True)
 
 
 if __name__ == "__main__":
@@ -211,6 +234,7 @@ def parse_args():
     p.add_argument("--start_object", type=int, default=0)
     p.add_argument("--preview_count", type=int, default=48)
     p.add_argument("--parallel_workers", type=int, default=1, help="Run several Blender processes on disjoint object shards")
+    p.add_argument("--preview_only", action="store_true", help="Only create mask_repair_preview.jpg from current files")
     p.add_argument("--dry_run", action="store_true")
     return p.parse_args()
 
@@ -354,7 +378,7 @@ def split_evenly(items: list[dict], parts: int) -> list[list[dict]]:
     return shards
 
 
-def blender_command(blender: str, worker_path: Path, manifest_path: Path, dataset_root: Path, args) -> list[str]:
+def blender_command(blender: str, worker_path: Path, manifest_path: Path, dataset_root: Path, args, worker_id: int) -> list[str]:
     return [
         blender,
         "--background",
@@ -370,13 +394,15 @@ def blender_command(blender: str, worker_path: Path, manifest_path: Path, datase
         str(args.resolution),
         "--engine",
         args.engine,
+        "--worker_id",
+        str(worker_id),
     ]
 
 
 def run_blender_parallel(blender: str, worker_path: Path, manifest_path: Path, items: list[dict], dataset_root: Path, args) -> None:
     workers = max(1, int(args.parallel_workers))
     if workers == 1 or len(items) <= 1:
-        cmd = blender_command(blender, worker_path, manifest_path, dataset_root, args)
+        cmd = blender_command(blender, worker_path, manifest_path, dataset_root, args, 0)
         print("+ " + " ".join(cmd), flush=True)
         subprocess.run(cmd, check=True)
         return
@@ -386,7 +412,7 @@ def run_blender_parallel(blender: str, worker_path: Path, manifest_path: Path, i
     for idx, shard in enumerate(shards):
         shard_path = manifest_path.with_name(f"{manifest_path.stem}_shard_{idx:02d}.json")
         shard_path.write_text(json.dumps(shard, indent=2), encoding="utf-8")
-        cmd = blender_command(blender, worker_path, shard_path, dataset_root, args)
+        cmd = blender_command(blender, worker_path, shard_path, dataset_root, args, idx)
         print(f"+ shard={idx + 1}/{len(shards)} objects={len(shard)} " + " ".join(cmd), flush=True)
         processes.append((idx, subprocess.Popen(cmd)))
 
@@ -405,6 +431,14 @@ def main():
     if not dataset_root.exists():
         raise FileNotFoundError(dataset_root)
 
+    if args.preview_only:
+        sheet = make_preview_sheet(dataset_root, args.preview_count)
+        if sheet:
+            print(f"Preview sheet: {sheet}", flush=True)
+        else:
+            print("Preview sheet was not created: no render/mask pairs found.", flush=True)
+        return
+
     script_dir = dataset_root / "_scripts"
     script_dir.mkdir(parents=True, exist_ok=True)
     worker_path = script_dir / "repair_mask_worker.py"
@@ -419,12 +453,23 @@ def main():
     )
     manifest_path.write_text(json.dumps(items, indent=2), encoding="utf-8")
     total_views = sum(len(item["views"]) for item in items)
+    avg_views = total_views / max(len(items), 1)
     print(f"Dataset: {dataset_root}", flush=True)
     print(f"Existing valid views: {valid_views}", flush=True)
     print(f"Views to repair: {total_views}", flush=True)
     print(f"Objects to repair: {len(items)}", flush=True)
+    print(f"Average views/object to repair: {avg_views:.1f}", flush=True)
+    print(f"Parallel Blender workers: {max(1, int(args.parallel_workers))}", flush=True)
 
-    if args.dry_run or not items:
+    if args.dry_run:
+        sheet = make_preview_sheet(dataset_root, args.preview_count)
+        if sheet:
+            print(f"Preview sheet: {sheet}", flush=True)
+        return
+    if not items:
+        sheet = make_preview_sheet(dataset_root, args.preview_count)
+        if sheet:
+            print(f"Preview sheet: {sheet}", flush=True)
         return
 
     worker_path.write_text(BLENDER_MASK_WORKER, encoding="utf-8")
