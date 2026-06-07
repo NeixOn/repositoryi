@@ -717,6 +717,9 @@ def train(args):
 
     excluded = read_excluded_uids(args.exclude_uids)
     grouped = read_dataset(dataset_root, excluded)
+    if args.max_objects > 0:
+        selected_uids = sorted(grouped.keys())[: args.max_objects]
+        grouped = {uid: grouped[uid] for uid in selected_uids}
     train_uids, val_uids, test_uids = split_uids(dataset_root, grouped, args.seed, args.train_ratio, args.val_ratio)
 
     if rank == 0:
@@ -1015,6 +1018,7 @@ def parse_args():
     p.add_argument("--dataset_root", default="")
     p.add_argument("--work_dir", default="/data/runs/chair_dinov2_lrm_render")
     p.add_argument("--exclude_uids", default="")
+    p.add_argument("--max_objects", type=int, default=0)
     p.add_argument("--dinov2_model", default="dinov2_vitl14_reg")
     p.add_argument("--image_size", type=int, default=518)
     p.add_argument("--batch_size", type=int, default=1)
