@@ -122,7 +122,7 @@ def import_mesh(mesh_path):
     return meshes
 
 
-def add_camera_from_json(camera_json, resolution_override):
+def configure_camera_from_json(camera, camera_json, resolution_override):
     data = json.loads(Path(camera_json).read_text(encoding="utf-8"))
     intr = data["intrinsics"]
     width = int(resolution_override or intr.get("width", 512))
@@ -133,8 +133,6 @@ def add_camera_from_json(camera_json, resolution_override):
     scene.render.resolution_y = height
     scene.render.resolution_percentage = 100
 
-    bpy.ops.object.camera_add()
-    camera = bpy.context.object
     camera.data.lens = float(intr.get("lens_mm", 55.0))
     camera.data.sensor_width = float(intr.get("sensor_width_mm", 32.0))
     camera.data.clip_start = 0.01
@@ -145,14 +143,27 @@ def add_camera_from_json(camera_json, resolution_override):
     return camera
 
 
-def render_one_view(mesh_path, camera_json, out_path, resolution_override, engine):
+def add_camera():
+    bpy.ops.object.camera_add()
+    camera = bpy.context.object
+    bpy.context.scene.camera = camera
+    return camera
+
+
+def render_object_views(mesh_path, views, dataset_root, uid, resolution_override, engine):
     clear_scene()
     setup_scene(engine)
     import_mesh(mesh_path)
-    add_camera_from_json(camera_json, resolution_override)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    bpy.context.scene.render.filepath = str(out_path)
-    bpy.ops.render.render(write_still=True)
+    camera = add_camera()
+    out_dir = dataset_root / "masks" / uid
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for view in views:
+        camera_json = dataset_root / "cameras" / uid / f"view_{view:03d}.json"
+        out_path = out_dir / f"view_{view:03d}.png"
+        configure_camera_from_json(camera, camera_json, resolution_override)
+        bpy.context.scene.render.filepath = str(out_path)
+        bpy.ops.render.render(write_still=True)
 
 
 def main():
@@ -167,11 +178,8 @@ def main():
         uid = item["uid"]
         mesh_path = dataset_root / "objects" / uid / "normalized.glb"
         obj_start = time.time()
-        for view in item["views"]:
-            camera_json = dataset_root / "cameras" / uid / f"view_{view:03d}.json"
-            out_path = dataset_root / "masks" / uid / f"view_{view:03d}.png"
-            render_one_view(mesh_path, camera_json, out_path, args.resolution, args.engine)
-            done += 1
+        render_object_views(mesh_path, item["views"], dataset_root, uid, args.resolution, args.engine)
+        done += len(item["views"])
         elapsed = time.time() - start
         sec_per_view = elapsed / max(done, 1)
         eta = sec_per_view * max(total - done, 0) / 60.0
