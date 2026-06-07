@@ -249,14 +249,17 @@ def find_blender(args) -> str:
 def mask_is_valid(path: Path) -> tuple[bool, float]:
     if not path.exists():
         return False, -1.0
-    from PIL import Image
-    import numpy as np
+    try:
+        from PIL import Image
+        import numpy as np
 
-    arr = np.asarray(Image.open(path).convert("L"), dtype=np.uint8)
-    if arr.size == 0:
+        arr = np.asarray(Image.open(path).convert("L"), dtype=np.uint8)
+        if arr.size == 0:
+            return False, -1.0
+        fg_ratio = float((arr > 8).mean())
+        return 0.002 <= fg_ratio <= 0.95, fg_ratio
+    except Exception:
         return False, -1.0
-    fg_ratio = float((arr > 8).mean())
-    return 0.002 <= fg_ratio <= 0.95, fg_ratio
 
 
 def load_uids(dataset_root: Path, views: int) -> list[str]:
