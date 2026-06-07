@@ -210,6 +210,7 @@ def parse_args():
     p.add_argument("--max_objects", type=int, default=0)
     p.add_argument("--start_object", type=int, default=0)
     p.add_argument("--preview_count", type=int, default=48)
+    p.add_argument("--parallel_workers", type=int, default=1, help="Run several Blender processes on disjoint object shards")
     p.add_argument("--dry_run", action="store_true")
     return p.parse_args()
 
@@ -345,6 +346,59 @@ def make_preview_sheet(dataset_root: Path, count: int) -> Path | None:
     return out_path
 
 
+def split_evenly(items: list[dict], parts: int) -> list[list[dict]]:
+    parts = max(1, min(parts, len(items)))
+    shards = [[] for _ in range(parts)]
+    for idx, item in enumerate(items):
+        shards[idx % parts].append(item)
+    return shards
+
+
+def blender_command(blender: str, worker_path: Path, manifest_path: Path, dataset_root: Path, args) -> list[str]:
+    return [
+        blender,
+        "--background",
+        "--factory-startup",
+        "--python",
+        str(worker_path),
+        "--",
+        "--manifest",
+        str(manifest_path),
+        "--dataset_root",
+        str(dataset_root),
+        "--resolution",
+        str(args.resolution),
+        "--engine",
+        args.engine,
+    ]
+
+
+def run_blender_parallel(blender: str, worker_path: Path, manifest_path: Path, items: list[dict], dataset_root: Path, args) -> None:
+    workers = max(1, int(args.parallel_workers))
+    if workers == 1 or len(items) <= 1:
+        cmd = blender_command(blender, worker_path, manifest_path, dataset_root, args)
+        print("+ " + " ".join(cmd), flush=True)
+        subprocess.run(cmd, check=True)
+        return
+
+    shards = split_evenly(items, workers)
+    processes = []
+    for idx, shard in enumerate(shards):
+        shard_path = manifest_path.with_name(f"{manifest_path.stem}_shard_{idx:02d}.json")
+        shard_path.write_text(json.dumps(shard, indent=2), encoding="utf-8")
+        cmd = blender_command(blender, worker_path, shard_path, dataset_root, args)
+        print(f"+ shard={idx + 1}/{len(shards)} objects={len(shard)} " + " ".join(cmd), flush=True)
+        processes.append((idx, subprocess.Popen(cmd)))
+
+    failed = []
+    for idx, process in processes:
+        returncode = process.wait()
+        if returncode != 0:
+            failed.append((idx, returncode))
+    if failed:
+        raise subprocess.CalledProcessError(failed[0][1], f"parallel blender shard {failed[0][0]}")
+
+
 def main():
     args = parse_args()
     dataset_root = Path(args.dataset_root).expanduser().resolve()
@@ -376,24 +430,7 @@ def main():
     worker_path.write_text(BLENDER_MASK_WORKER, encoding="utf-8")
     blender = find_blender(args)
     start = time.time()
-    cmd = [
-        blender,
-        "--background",
-        "--factory-startup",
-        "--python",
-        str(worker_path),
-        "--",
-        "--manifest",
-        str(manifest_path),
-        "--dataset_root",
-        str(dataset_root),
-        "--resolution",
-        str(args.resolution),
-        "--engine",
-        args.engine,
-    ]
-    print("+ " + " ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True)
+    run_blender_parallel(blender, worker_path, manifest_path, items, dataset_root, args)
 
     repaired_items, valid_after, invalid_after = build_manifest(
         dataset_root,
