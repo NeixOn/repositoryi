@@ -352,6 +352,8 @@ def build_model(args):
             b = latent.shape[0]
             x = self.fc(latent).view(b * 3, self.c, 8, 8)
             x = self.up(x)
+            if x.shape[-1] != self.s or x.shape[-2] != self.s:
+                x = F.interpolate(x, size=(self.s, self.s), mode="bilinear", align_corners=False)
             return x.view(b, 3, self.c, self.s, self.s)
 
     class RadianceDecoder(nn.Module):
@@ -445,7 +447,7 @@ def render_rays(model, planes, rays_o, rays_d, args, training: bool):
     return color, acc, depth, weights.squeeze(-1)
 
 
-def render_losses(pred_rgb, pred_mask, pred_depth, weights, target_rgb, target_mask, args):
+def render_losses(pred_rgb, pred_mask, pred_depth, weights, target_rgb, target_mask, args, stage=None):
     import torch
     import torch.nn.functional as F
 
@@ -463,7 +465,11 @@ def render_losses(pred_rgb, pred_mask, pred_depth, weights, target_rgb, target_m
     mean_t = (weights * torch.arange(weights.shape[-1], device=weights.device, dtype=weights.dtype)).sum(dim=-1, keepdim=True) / weights_sum
     distortion = (weights * (torch.arange(weights.shape[-1], device=weights.device, dtype=weights.dtype) - mean_t).abs()).mean()
 
-    total = rgb_loss + args.mask_weight * mask_loss + args.opacity_weight * opacity_loss + args.distortion_weight * distortion
+    stage = stage or {}
+    mask_weight = args.mask_weight * stage.get("mask", 1.0)
+    opacity_weight = args.opacity_weight * stage.get("opacity", 1.0)
+    distortion_weight = args.distortion_weight * stage.get("distortion", 1.0)
+    total = rgb_loss + mask_weight * mask_loss + opacity_weight * opacity_loss + distortion_weight * distortion
     return total, {
         "rgb": rgb_loss.detach(),
         "mask": mask_loss.detach(),
@@ -484,6 +490,64 @@ def geometry_density_loss(model, planes, geo_query, geo_target):
     surface_loss = (1.0 - surface).abs().mean() if surface.numel() else bce * 0.0
     empty_loss = empty.abs().mean() if empty.numel() else bce * 0.0
     return bce + 0.25 * surface_loss + 0.25 * empty_loss
+
+
+def stage_weights(args, epoch: int) -> dict:
+    if epoch <= args.geometry_warmup_epochs:
+        return {
+            "mask": args.warmup_mask_mult,
+            "opacity": args.warmup_opacity_mult,
+            "distortion": 1.0,
+            "geometry": args.warmup_geometry_mult,
+            "perceptual": 0.0,
+        }
+    return {
+        "mask": 1.0,
+        "opacity": 1.0,
+        "distortion": 1.0,
+        "geometry": 1.0,
+        "perceptual": 1.0,
+    }
+
+
+def build_perceptual_model(args, device, rank: int):
+    if args.perceptual_weight <= 0:
+        return None
+    try:
+        import torch
+        import torchvision
+
+        weights = torchvision.models.VGG16_Weights.IMAGENET1K_FEATURES
+        model = torchvision.models.vgg16(weights=weights).features[:16].eval().to(device)
+        for param in model.parameters():
+            param.requires_grad_(False)
+        if rank == 0:
+            print("VGG perceptual loss enabled.", flush=True)
+        return model
+    except Exception as exc:
+        if rank == 0:
+            print(f"VGG perceptual loss disabled: {exc}", flush=True)
+        return None
+
+
+def perceptual_patch_loss(perceptual_model, pred_rgb, target_rgb, patch_size: int):
+    if perceptual_model is None:
+        return pred_rgb.sum() * 0.0
+    import torch
+    import torch.nn.functional as F
+
+    b = pred_rgb.shape[0]
+    pred = pred_rgb.view(b, patch_size, patch_size, 3).permute(0, 3, 1, 2).contiguous()
+    target = target_rgb.view(b, patch_size, patch_size, 3).permute(0, 3, 1, 2).contiguous()
+    if patch_size < 64:
+        pred = F.interpolate(pred, size=(64, 64), mode="bilinear", align_corners=False)
+        target = F.interpolate(target, size=(64, 64), mode="bilinear", align_corners=False)
+    mean = pred.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    std = pred.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    with torch.no_grad():
+        target_f = perceptual_model((target - mean) / std)
+    pred_f = perceptual_model((pred - mean) / std)
+    return F.l1_loss(pred_f, target_f)
 
 
 def set_encoder_trainable(model, trainable: bool):
@@ -518,6 +582,94 @@ def save_checkpoint(path: Path, model, optimizer, epoch: int, args, best_val: fl
         },
         path,
     )
+
+
+def load_checkpoint_if_requested(path: str, model, optimizer, device, rank: int):
+    if not path:
+        return 1, float("inf")
+    import torch
+
+    ckpt_path = Path(path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(ckpt_path)
+    ckpt = torch.load(ckpt_path, map_location=device)
+    module = model.module if hasattr(model, "module") else model
+    module.load_state_dict(ckpt["model"], strict=True)
+    if optimizer is not None and ckpt.get("optimizer") is not None:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    start_epoch = int(ckpt.get("epoch", 0)) + 1
+    best_val = float(ckpt.get("best_val", float("inf")))
+    if rank == 0:
+        print(f"resumed checkpoint: {ckpt_path} start_epoch={start_epoch} best_val={best_val:.6f}", flush=True)
+    return start_epoch, best_val
+
+
+def save_validation_preview(model, grouped, val_uids, args, work_dir: Path, epoch: int, device) -> None:
+    if args.preview_every <= 0 or epoch % args.preview_every != 0 or not val_uids:
+        return
+    import torch
+    from PIL import Image, ImageDraw
+
+    module = model.module if hasattr(model, "module") else model
+    module.eval()
+
+    uid = val_uids[(epoch - 1) % len(val_uids)]
+    rows = grouped[uid]
+    if len(rows) < 2:
+        return
+    source = rows[0]
+    target = rows[1]
+
+    source_np = load_source_image(source["image_path"], source["mask_path"], args.image_size, args.crop)
+    target_rgb, target_mask = load_rgb_mask(target["image_path"], target["mask_path"])
+    h, w = target_mask.shape
+    preview_size = args.preview_size
+    xs, ys = np.meshgrid(
+        (np.arange(preview_size, dtype=np.float32) + 0.5) * (w / preview_size),
+        (np.arange(preview_size, dtype=np.float32) + 0.5) * (h / preview_size),
+        indexing="xy",
+    )
+    rays_o, rays_d = camera_rays(target["camera_path"], xs.reshape(-1), ys.reshape(-1))
+
+    source_t = torch.from_numpy(source_np[None]).to(device)
+    rays_o_t = torch.from_numpy(rays_o[None]).to(device)
+    rays_d_t = torch.from_numpy(rays_d[None]).to(device)
+
+    pred_rgb_parts = []
+    pred_mask_parts = []
+    with torch.no_grad():
+        planes = module.planes(source_t)
+        for start in range(0, rays_o_t.shape[1], args.preview_ray_chunk):
+            ro = rays_o_t[:, start : start + args.preview_ray_chunk]
+            rd = rays_d_t[:, start : start + args.preview_ray_chunk]
+            rgb, mask, _, _ = render_rays(module, planes, ro, rd, args, training=False)
+            pred_rgb_parts.append(rgb.float().cpu())
+            pred_mask_parts.append(mask.float().cpu())
+
+    pred_rgb = torch.cat(pred_rgb_parts, dim=1).numpy()[0].reshape(preview_size, preview_size, 3)
+    pred_mask = torch.cat(pred_mask_parts, dim=1).numpy()[0].reshape(preview_size, preview_size)
+
+    source_img = Image.fromarray(np.clip(np.transpose(source_np, (1, 2, 0)) * 255, 0, 255).astype(np.uint8)).resize((preview_size, preview_size))
+    target_img = Image.fromarray(np.clip(target_rgb * 255, 0, 255).astype(np.uint8)).resize((preview_size, preview_size))
+    pred_img = Image.fromarray(np.clip(pred_rgb * 255, 0, 255).astype(np.uint8))
+    target_mask_img = Image.fromarray(np.clip(target_mask * 255, 0, 255).astype(np.uint8)).resize((preview_size, preview_size))
+    pred_mask_img = Image.fromarray(np.clip(pred_mask * 255, 0, 255).astype(np.uint8))
+
+    labels = ["source", "target", "pred", "target_mask", "pred_mask"]
+    images = [source_img, target_img, pred_img, target_mask_img.convert("RGB"), pred_mask_img.convert("RGB")]
+    label_h = 24
+    sheet = Image.new("RGB", (preview_size * len(images), preview_size + label_h), (245, 245, 245))
+    draw = ImageDraw.Draw(sheet)
+    for idx, (label, img) in enumerate(zip(labels, images)):
+        x = idx * preview_size
+        sheet.paste(img, (x, label_h))
+        draw.text((x + 6, 4), label, fill=(20, 20, 20))
+
+    out_dir = work_dir / "val_previews"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"epoch_{epoch:03d}_{uid}.jpg"
+    sheet.save(out_path, quality=92)
+    print(f"validation preview saved: {out_path}", flush=True)
 
 
 def train(args):
@@ -572,8 +724,15 @@ def train(args):
     if distributed:
         torch.distributed.barrier()
 
+    resume_epoch = 0
+    if args.resume_checkpoint:
+        resume_path = Path(args.resume_checkpoint)
+        if resume_path.exists():
+            resume_epoch = int(torch.load(resume_path, map_location="cpu").get("epoch", 0))
+
+    encoder_trainable = args.encoder_lr > 0 and (resume_epoch + 1) >= args.unfreeze_encoder_epoch
     model = build_model(args).to(device)
-    set_encoder_trainable(model, False)
+    set_encoder_trainable(model, encoder_trainable)
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
@@ -601,25 +760,28 @@ def train(args):
         drop_last=False,
     )
 
-    optimizer = make_optimizer(model, args, encoder_trainable=False)
+    optimizer = make_optimizer(model, args, encoder_trainable=encoder_trainable)
     scaler = torch.amp.GradScaler("cuda", enabled=(args.amp == "fp16" and device.type == "cuda"))
     amp_dtype = torch.float16 if args.amp == "fp16" else torch.bfloat16
-    best_val = float("inf")
+    perceptual_model = build_perceptual_model(args, device, rank)
+    start_epoch, best_val = load_checkpoint_if_requested(args.resume_checkpoint, model, optimizer, device, rank)
 
     if rank == 0:
         print(f"Device={device} world={world}", flush=True)
         print(f"Training started. steps_per_epoch={len(train_loader)} patch={args.patch_size} samples={args.samples_per_ray}", flush=True)
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        if epoch == args.unfreeze_encoder_epoch:
+        if epoch == args.unfreeze_encoder_epoch and not encoder_trainable:
             if rank == 0:
                 print(f"Unfreezing DINOv2 backbone at epoch {epoch}", flush=True)
             set_encoder_trainable(model, True)
             optimizer = make_optimizer(model, args, encoder_trainable=True)
+            encoder_trainable = True
 
         model.train()
+        stage = stage_weights(args, epoch)
         optimizer.zero_grad(set_to_none=True)
         train_losses = []
         train_parts = defaultdict(list)
@@ -645,9 +807,16 @@ def train(args):
                 target_rgb.float(),
                 target_mask.float(),
                 args,
+                stage,
             )
+            if perceptual_model is not None and stage.get("perceptual", 1.0) > 0:
+                perc_loss = perceptual_patch_loss(perceptual_model, pred_rgb.float(), target_rgb.float(), args.patch_size)
+                loss = loss + args.perceptual_weight * stage["perceptual"] * perc_loss
+                parts["perc"] = perc_loss.detach()
+            else:
+                parts["perc"] = loss.detach() * 0.0
             geo_loss = geometry_density_loss(module, planes.float(), geo_query.float(), geo_target.float())
-            loss = loss + args.geometry_weight * geo_loss
+            loss = loss + args.geometry_weight * stage.get("geometry", 1.0) * geo_loss
             parts["geo"] = geo_loss.detach()
             loss = loss / args.grad_accum
 
@@ -673,6 +842,7 @@ def train(args):
                     f"rgb={np.mean(train_parts['rgb'][-args.log_every:]):.5f} "
                     f"mask={np.mean(train_parts['mask'][-args.log_every:]):.5f} "
                     f"geo={np.mean(train_parts['geo'][-args.log_every:]):.5f} "
+                    f"perc={np.mean(train_parts['perc'][-args.log_every:]):.5f} "
                     f"sec/step={sec:.3f} eta_min={eta:.1f}",
                     flush=True,
                 )
@@ -705,21 +875,49 @@ def train(args):
                     target_rgb.float(),
                     target_mask.float(),
                     args,
+                    stage,
                 )
+                if perceptual_model is not None and stage.get("perceptual", 1.0) > 0:
+                    perc_loss = perceptual_patch_loss(perceptual_model, pred_rgb.float(), target_rgb.float(), args.patch_size)
+                    loss = loss + args.perceptual_weight * stage["perceptual"] * perc_loss
                 geo_loss = geometry_density_loss(module, planes.float(), geo_query.float(), geo_target.float())
-                loss = loss + args.geometry_weight * geo_loss
+                loss = loss + args.geometry_weight * stage.get("geometry", 1.0) * geo_loss
                 val_losses.append(float(loss.detach().cpu()))
 
         train_loss = float(np.mean(train_losses)) if train_losses else float("inf")
         val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
         if rank == 0:
             epoch_min = (time.time() - start) / 60.0
-            print(f"epoch={epoch:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f} epoch_min={epoch_min:.1f}", flush=True)
+            epoch_rgb = float(np.mean(train_parts["rgb"])) if train_parts["rgb"] else 0.0
+            epoch_mask = float(np.mean(train_parts["mask"])) if train_parts["mask"] else 0.0
+            epoch_geo = float(np.mean(train_parts["geo"])) if train_parts["geo"] else 0.0
+            epoch_perc = float(np.mean(train_parts["perc"])) if train_parts["perc"] else 0.0
+            print(
+                f"epoch={epoch:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f} "
+                f"rgb={epoch_rgb:.5f} mask={epoch_mask:.5f} geo={epoch_geo:.5f} perc={epoch_perc:.5f} "
+                f"epoch_min={epoch_min:.1f}",
+                flush=True,
+            )
+            save_validation_preview(model, grouped, val_uids, args, work_dir, epoch, device)
             with open(work_dir / "train_log.csv", "a", encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_loss", "epoch_min"])
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["epoch", "train_loss", "val_loss", "train_rgb", "train_mask", "train_geo", "train_perc", "epoch_min"],
+                )
                 if f.tell() == 0:
                     writer.writeheader()
-                writer.writerow({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "epoch_min": epoch_min})
+                writer.writerow(
+                    {
+                        "epoch": epoch,
+                        "train_loss": train_loss,
+                        "val_loss": val_loss,
+                        "train_rgb": epoch_rgb,
+                        "train_mask": epoch_mask,
+                        "train_geo": epoch_geo,
+                        "train_perc": epoch_perc,
+                        "epoch_min": epoch_min,
+                    }
+                )
             save_checkpoint(work_dir / "latest.pt", model, optimizer, epoch, args, best_val)
             if val_loss < best_val:
                 best_val = val_loss
@@ -818,6 +1016,11 @@ def parse_args():
     p.add_argument("--opacity_weight", type=float, default=0.04)
     p.add_argument("--distortion_weight", type=float, default=0.002)
     p.add_argument("--geometry_weight", type=float, default=0.08)
+    p.add_argument("--perceptual_weight", type=float, default=0.04)
+    p.add_argument("--geometry_warmup_epochs", type=int, default=3)
+    p.add_argument("--warmup_mask_mult", type=float, default=1.6)
+    p.add_argument("--warmup_opacity_mult", type=float, default=1.5)
+    p.add_argument("--warmup_geometry_mult", type=float, default=1.8)
     p.add_argument("--charbonnier_eps", type=float, default=1e-3)
     p.add_argument("--background", type=float, nargs=3, default=(219 / 255.0, 222 / 255.0, 224 / 255.0))
     p.add_argument("--amp", choices=("none", "fp16", "bf16"), default="bf16")
@@ -827,11 +1030,15 @@ def parse_args():
     p.add_argument("--train_ratio", type=float, default=0.8)
     p.add_argument("--val_ratio", type=float, default=0.1)
     p.add_argument("--val_batches", type=int, default=80)
+    p.add_argument("--preview_every", type=int, default=1)
+    p.add_argument("--preview_size", type=int, default=128)
+    p.add_argument("--preview_ray_chunk", type=int, default=4096)
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--skip_install", action="store_true")
     p.add_argument("--require_cuda", action="store_true")
+    p.add_argument("--resume_checkpoint", default="")
     p.add_argument("--checkpoint", default="")
     p.add_argument("--image", default="")
     p.add_argument("--mask", default="")
