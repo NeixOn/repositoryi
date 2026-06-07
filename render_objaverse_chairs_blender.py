@@ -781,8 +781,10 @@ def object_files_complete(output_dir: Path, uid: str, views: int, modalities: se
         name = f"view_{view_idx:03d}"
         if "rgb" in modalities and not (output_dir / "renders" / uid / f"{name}.png").exists():
             return False
-        if "mask" in modalities and not (output_dir / "masks" / uid / f"{name}.png").exists():
-            return False
+        if "mask" in modalities:
+            mask_path = output_dir / "masks" / uid / f"{name}.png"
+            if not mask_file_is_valid(mask_path):
+                return False
         if "depth" in modalities and not (output_dir / "depths" / uid / f"{name}.exr").exists():
             return False
         if "normal" in modalities and not (output_dir / "normals" / uid / f"{name}.png").exists():
@@ -792,12 +794,27 @@ def object_files_complete(output_dir: Path, uid: str, views: int, modalities: se
     return True
 
 
+def mask_file_is_valid(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        from PIL import Image
+        import numpy as np
+
+        arr = np.asarray(Image.open(path).convert("L"), dtype=np.uint8)
+        if arr.size == 0:
+            return False
+        fg_ratio = float((arr > 8).mean())
+        return 0.002 <= fg_ratio <= 0.95
+    except Exception:
+        return False
+
+
 def filter_resume_uids(output_dir: Path, uids: Sequence[str], views: int, modalities: set[str]) -> list[str]:
-    accepted = read_existing_object_uids(output_dir)
     remaining = []
     skipped = 0
     for uid in uids:
-        if uid in accepted or object_files_complete(output_dir, uid, views, modalities):
+        if object_files_complete(output_dir, uid, views, modalities):
             skipped += 1
             continue
         remaining.append(uid)
@@ -809,6 +826,9 @@ def filter_resume_uids(output_dir: Path, uids: Sequence[str], views: int, modali
 def composite_and_make_masks(output_dir: Path, background: tuple[int, int, int], modalities: set[str]) -> None:
     from PIL import Image
 
+    made_masks = 0
+    skipped_masks = 0
+    suspicious_masks = 0
     for path in (output_dir / "renders").glob("*/*.png"):
         uid = path.parent.name
 
@@ -818,8 +838,14 @@ def composite_and_make_masks(output_dir: Path, background: tuple[int, int, int],
             mask_dir = output_dir / "masks" / uid
             mask_dir.mkdir(parents=True, exist_ok=True)
             mask_path = mask_dir / path.name
-            mask = alpha.point(lambda value: 255 if value > 8 else 0)
-            mask.save(mask_path)
+            if mask_file_is_valid(mask_path):
+                skipped_masks += 1
+            else:
+                mask = alpha.point(lambda value: 255 if value > 8 else 0)
+                mask.save(mask_path)
+                made_masks += 1
+                if not mask_file_is_valid(mask_path):
+                    suspicious_masks += 1
 
         bg = Image.new("RGBA", img.size, (*background, 255))
         composed = Image.alpha_composite(bg, img).convert("RGB")
@@ -830,6 +856,12 @@ def composite_and_make_masks(output_dir: Path, background: tuple[int, int, int],
         bg = Image.new("RGBA", img.size, (128, 128, 255, 255))
         composed = Image.alpha_composite(bg, img).convert("RGB")
         composed.save(path)
+
+    if "mask" in modalities:
+        print(
+            f"Masks: made={made_masks} skipped_valid={skipped_masks} suspicious={suspicious_masks}",
+            flush=True,
+        )
 
 
 def create_points_npz(output_dir: Path, points_per_object: int, seed: int) -> None:
