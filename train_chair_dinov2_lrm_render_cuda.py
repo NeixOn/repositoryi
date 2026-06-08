@@ -454,11 +454,13 @@ def render_losses(pred_rgb, pred_mask, pred_depth, weights, target_rgb, target_m
     import torch
     import torch.nn.functional as F
 
-    fg_weight = 1.0 + args.foreground_rgb_weight * target_mask
+    fg_weight = args.background_rgb_weight * (1.0 - target_mask) + args.foreground_rgb_weight * target_mask
     rgb_diff = torch.sqrt((pred_rgb - target_rgb).pow(2) + args.charbonnier_eps)
-    rgb_loss = (rgb_diff * fg_weight).mean()
+    rgb_loss = (rgb_diff * fg_weight).sum() / (fg_weight.sum() * pred_rgb.shape[-1] + 1e-6)
 
-    bce = F.binary_cross_entropy(pred_mask.clamp(1e-4, 1.0 - 1e-4), target_mask)
+    mask_bce_weight = args.background_mask_weight * (1.0 - target_mask) + args.foreground_mask_weight * target_mask
+    bce_raw = F.binary_cross_entropy(pred_mask.clamp(1e-4, 1.0 - 1e-4), target_mask, reduction="none")
+    bce = (bce_raw * mask_bce_weight).sum() / (mask_bce_weight.sum() + 1e-6)
     inter = (pred_mask * target_mask).sum(dim=1)
     dice = 1.0 - (2.0 * inter + 1.0) / (pred_mask.sum(dim=1) + target_mask.sum(dim=1) + 1.0)
     mask_loss = bce + dice.mean()
@@ -1043,7 +1045,10 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=0.03)
     p.add_argument("--unfreeze_encoder_epoch", type=int, default=20)
     p.add_argument("--foreground_rgb_weight", type=float, default=4.0)
+    p.add_argument("--background_rgb_weight", type=float, default=0.05)
     p.add_argument("--mask_weight", type=float, default=0.35)
+    p.add_argument("--foreground_mask_weight", type=float, default=1.0)
+    p.add_argument("--background_mask_weight", type=float, default=0.05)
     p.add_argument("--mask_recall_weight", type=float, default=0.0)
     p.add_argument("--opacity_weight", type=float, default=0.04)
     p.add_argument("--distortion_weight", type=float, default=0.002)
