@@ -687,31 +687,31 @@ def save_validation_preview(model, grouped, val_uids, args, work_dir: Path, epoc
 
 
 def train(args):
-    import torch
-    from torch.nn.parallel import DistributedDataParallel as DDP
-    from torch.utils.data import DataLoader
-    from torch.utils.data.distributed import DistributedSampler
+    import torch  # Подключаем PyTorch: tensors, CUDA, autograd, optimizer, model.to(device).
+    from torch.nn.parallel import DistributedDataParallel as DDP  # DDP синхронизирует обучение между несколькими GPU.
+    from torch.utils.data import DataLoader  # DataLoader собирает samples из dataset в batch и грузит их в несколько workers.
+    from torch.utils.data.distributed import DistributedSampler  # DistributedSampler делит dataset между GPU-процессами в DDP.
 
-    ensure_deps(args.skip_install)
-    if args.require_cuda and not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required but unavailable")
+    ensure_deps(args.skip_install)  # Проверяем/устанавливаем зависимости, если запуск не был сделан с --skip_install.
+    if args.require_cuda and not torch.cuda.is_available():  # Если пользователь потребовал CUDA, но PyTorch не видит GPU.
+        raise RuntimeError("CUDA is required but unavailable")  # Сразу останавливаемся, чтобы случайно не учиться на CPU.
 
-    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
-    if distributed:
-        torch.distributed.init_process_group(backend="nccl")
-        rank = int(os.environ["RANK"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        world = int(os.environ["WORLD_SIZE"])
-        torch.cuda.set_device(local_rank)
-        device = torch.device("cuda", local_rank)
-    else:
-        rank = 0
-        local_rank = 0
-        world = 1
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ  # Проверяем, запущен ли скрипт через torchrun/DDP.
+    if distributed:  # Ветка для multi-GPU запуска, когда каждый процесс работает со своей видеокартой.
+        torch.distributed.init_process_group(backend="nccl")  # Инициализируем связь между GPU-процессами через быстрый NCCL backend.
+        rank = int(os.environ["RANK"])  # Глобальный номер процесса: 0 главный, остальные вспомогательные.
+        local_rank = int(os.environ["LOCAL_RANK"])  # Номер GPU внутри текущей машины, например cuda:0 или cuda:1.
+        world = int(os.environ["WORLD_SIZE"])  # Общее количество процессов/GPU, участвующих в обучении.
+        torch.cuda.set_device(local_rank)  # Привязываем текущий процесс к его конкретной GPU.
+        device = torch.device("cuda", local_rank)  # Создаем объект device, на который потом переносится модель и batch.
+    else:  # Ветка обычного запуска одной командой python3 без torchrun.
+        rank = 0  # Единственный процесс считаем главным.
+        local_rank = 0  # Локальная GPU по умолчанию первая.
+        world = 1  # Всего один процесс, распределенного обучения нет.
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # Выбираем GPU, если доступна, иначе CPU.
 
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True  # Разрешаем быстрый TF32 для matrix multiplication на Ampere/Ada GPU.
+    torch.backends.cudnn.allow_tf32 = True  # Разрешаем TF32 в cuDNN для ускорения convolution-like операций.
 
     dataset_root = Path(args.dataset_root).resolve()
     work_dir = Path(args.work_dir)
