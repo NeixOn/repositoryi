@@ -327,7 +327,8 @@ def train(args):
         if rank == 0:
             epoch_min = (time.time() - start) / 60.0
             write_epoch_outputs(work_dir, model, optimizer, args, epoch, best_val, train_loss, val_loss, train_parts, epoch_min)
-            save_validation_preview(model, grouped, val_uids, args, work_dir, epoch, device)
+            preview_uids = train_uids if args.preview_train else val_uids
+            save_validation_preview(model, grouped, preview_uids, args, work_dir, epoch, device)
             if val_loss < best_val:
                 best_val = val_loss
                 save_checkpoint(work_dir / "best.pt", model, optimizer, epoch, args, best_val)
@@ -335,4 +336,3 @@ def train(args):
 
     if distributed:
         torch.distributed.destroy_process_group()
-
