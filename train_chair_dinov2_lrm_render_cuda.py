@@ -30,8 +30,8 @@ from typing import Dict, List
 import numpy as np
 
 
-BOX_MIN = (-1.05, -1.05, -0.08)
-BOX_MAX = (1.05, 1.05, 1.92)
+BOX_MIN = (-1.05, -1.05, -1.05)
+BOX_MAX = (1.05, 1.05, 1.05)
 
 
 def ensure_deps(skip_install: bool) -> None:
