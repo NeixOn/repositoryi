@@ -95,7 +95,86 @@ def read_uids(path: str) -> list[str]:
     return [line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def find_first(root: Path, filename: str) -> Path | None:
+    if not root.exists():
+        return None
+    direct = root / filename
+    if direct.exists():
+        return direct
+    for path in root.rglob(filename):
+        if path.is_file():
+            return path
+    return None
+
+
+def looks_like_dataset_root(path: Path) -> bool:
+    return (path / "renders").exists() and (path / "objects").exists()
+
+
+def resolve_dataset_root(root: Path) -> Path:
+    if looks_like_dataset_root(root):
+        return root
+    if not root.exists():
+        return root
+    candidates = []
+    for path in root.rglob("*"):
+        if path.is_dir() and looks_like_dataset_root(path):
+            candidates.append(path)
+    if candidates:
+        candidates = sorted(candidates, key=lambda p: (len(p.parts), str(p)))
+        print(f"[paths] auto dataset_root: {candidates[0]}", flush=True)
+        return candidates[0]
+    return root
+
+
+def discover_uids_from_layout(dataset_root: Path, mask_root: Path, views: int) -> list[str]:
+    sources = []
+    for dirname in ("renders", "objects"):
+        root = dataset_root / dirname
+        if root.exists():
+            sources.extend([p.name for p in root.iterdir() if p.is_dir()])
+    if mask_root.exists():
+        sources.extend([p.name for p in mask_root.iterdir() if p.is_dir()])
+    counts = {}
+    for uid in sources:
+        counts[uid] = counts.get(uid, 0) + 1
+    uids = []
+    for uid in sorted(counts):
+        point_ok = points_path(dataset_root, uid).exists()
+        views_ok = all(image_path(dataset_root, uid, v).exists() and mask_path(mask_root, uid, v).exists() for v in range(views))
+        if point_ok and views_ok:
+            uids.append(uid)
+    return uids
+
+
+def resolve_metadata_paths(args: argparse.Namespace) -> None:
+    dataset_root = resolve_dataset_root(Path(args.dataset_root))
+    args.dataset_root = str(dataset_root)
+
+    mask_root = Path(args.mask_root)
+    if not mask_root.exists():
+        candidate = dataset_root / "masks"
+        if candidate.exists():
+            print(f"[paths] auto mask_root: {candidate}", flush=True)
+            args.mask_root = str(candidate)
+
+    clean_path = Path(args.clean_uids)
+    if not clean_path.exists():
+        found = find_first(dataset_root, "clean_uids.txt")
+        if found:
+            print(f"[paths] auto clean_uids: {found}", flush=True)
+            args.clean_uids = str(found)
+
+    splits_path = Path(args.splits_json)
+    if not splits_path.exists():
+        found = find_first(dataset_root, "splits.json")
+        if found:
+            print(f"[paths] auto splits_json: {found}", flush=True)
+            args.splits_json = str(found)
+
+
 def load_splits(args: argparse.Namespace) -> tuple[list[str], list[str], list[str]]:
+    resolve_metadata_paths(args)
     splits_path = Path(args.splits_json)
     if splits_path.exists():
         raw = json.loads(splits_path.read_text(encoding="utf-8"))
@@ -103,7 +182,14 @@ def load_splits(args: argparse.Namespace) -> tuple[list[str], list[str], list[st
         val = list(raw.get("val", []))
         test = list(raw.get("test", []))
     else:
-        uids = read_uids(args.clean_uids)
+        clean_path = Path(args.clean_uids)
+        if clean_path.exists():
+            uids = read_uids(args.clean_uids)
+        else:
+            print("[paths] clean_uids/splits not found; discovering UID values from dataset folders.", flush=True)
+            uids = discover_uids_from_layout(Path(args.dataset_root), Path(args.mask_root), args.views)
+            if not uids:
+                raise FileNotFoundError(f"Could not find {clean_path} and could not discover usable UID folders.")
         rng = random.Random(args.seed)
         rng.shuffle(uids)
         n_train = int(len(uids) * 0.8)
