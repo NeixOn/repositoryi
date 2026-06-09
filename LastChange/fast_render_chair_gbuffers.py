@@ -8,8 +8,7 @@ It converts the fixed chair dataset into an InstantMesh-like per-object layout:
     rendering_random_24views/
       <uid>/
         000.png          RGBA copied from dataset RGB + fixed mask
-        000_depth.npy    float32 camera-space depth
-        000_depth.png    16-bit normalized depth preview/storage
+        000_depth.exr    Blender depth pass
         000_normal.png   uint8 world-space normal encoded from [-1, 1] to [0, 255]
         ...
         cameras.npz      camera_matrix_world + intrinsics arrays
@@ -84,9 +83,13 @@ def clean_scene():
 
 def configure_scene(resolution, device):
     scene = bpy.context.scene
-    scene.render.engine = "BLENDER_EEVEE_NEXT" if "BLENDER_EEVEE_NEXT" in [item.identifier for item in bpy.types.RenderSettings.bl_rna.properties["engine"].enum_items] else "BLENDER_EEVEE"
+    try:
+        scene.render.engine = "BLENDER_EEVEE_NEXT"
+    except Exception:
+        scene.render.engine = "BLENDER_EEVEE"
     scene.render.resolution_x = resolution
     scene.render.resolution_y = resolution
+    scene.render.resolution_percentage = 100
     scene.render.film_transparent = True
     scene.render.image_settings.file_format = "PNG"
     scene.render.image_settings.color_mode = "RGBA"
@@ -146,10 +149,9 @@ def setup_camera(camera_json, resolution):
 
     cam_obj.matrix_world = mathutils.Matrix(mat.tolist())
     cam_data.type = "PERSP"
-    cam_data.lens_unit = "FOV"
-    fov_x = 2.0 * math.atan(resolution / (2.0 * fx))
-    fov_y = 2.0 * math.atan(resolution / (2.0 * fy))
-    cam_data.angle = max(fov_x, fov_y)
+    cam_data.lens_unit = "MILLIMETERS"
+    cam_data.lens = float(intr.get("lens_mm", 55.0))
+    cam_data.sensor_width = float(intr.get("sensor_width_mm", 32.0))
     cam_data.shift_x = (cx - resolution / 2.0) / resolution
     cam_data.shift_y = -(cy - resolution / 2.0) / resolution
     cam_data.clip_start = 0.01
@@ -169,38 +171,83 @@ def copy_rgba(rgb_path, mask_path, out_path, resolution):
     rgba.save(out_path)
 
 
+def setup_depth_nodes(depth_dir, stem):
+    scene = bpy.context.scene
+    scene.use_nodes = True
+    tree = scene.node_tree
+    tree.nodes.clear()
+    render_layers = tree.nodes.new(type="CompositorNodeRLayers")
+    depth_out = tree.nodes.new(type="CompositorNodeOutputFile")
+    depth_out.base_path = str(depth_dir)
+    depth_out.file_slots[0].path = f"{stem}_depth_"
+    depth_out.format.file_format = "OPEN_EXR"
+    depth_out.format.color_mode = "RGB"
+    tree.links.new(render_layers.outputs["Depth"], depth_out.inputs[0])
+
+
+def find_depth_output(depth_dir, stem):
+    candidates = sorted(depth_dir.glob(f"{stem}_depth_*.exr"))
+    if not candidates:
+        return None
+    final_path = depth_dir / f"{stem}_depth.exr"
+    if final_path.exists():
+        final_path.unlink()
+    candidates[-1].rename(final_path)
+    for extra in candidates[:-1]:
+        if extra.exists():
+            extra.unlink()
+    return final_path
+
+
+def make_normal_material():
+    mat = bpy.data.materials.new("normal_override")
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+    out = nodes.new(type="ShaderNodeOutputMaterial")
+    geom = nodes.new(type="ShaderNodeNewGeometry")
+    vec_add = nodes.new(type="ShaderNodeVectorMath")
+    vec_add.operation = "ADD"
+    vec_add.inputs[1].default_value = (1.0, 1.0, 1.0)
+    vec_mul = nodes.new(type="ShaderNodeVectorMath")
+    vec_mul.operation = "MULTIPLY"
+    vec_mul.inputs[1].default_value = (0.5, 0.5, 0.5)
+    emission = nodes.new(type="ShaderNodeEmission")
+    emission.inputs["Strength"].default_value = 1.0
+    links.new(geom.outputs["Normal"], vec_add.inputs[0])
+    links.new(vec_add.outputs["Vector"], vec_mul.inputs[0])
+    links.new(vec_mul.outputs["Vector"], emission.inputs["Color"])
+    links.new(emission.outputs["Emission"], out.inputs["Surface"])
+    return mat
+
+
+def set_render_png_rgba():
+    scene = bpy.context.scene
+    scene.use_nodes = False
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "RGBA"
+    scene.render.film_transparent = True
+
+
 def render_depth_normal(out_dir, stem):
     scene = bpy.context.scene
-    scene.render.filepath = str(out_dir / f"{stem}_tmp.png")
+    view_layer = scene.view_layers[0]
+
+    setup_depth_nodes(out_dir, stem)
+    view_layer.material_override = None
+    scene.render.filepath = str(out_dir / f"{stem}_unused.png")
     bpy.ops.render.render(write_still=False)
-    result = bpy.data.images["Render Result"]
+    depth_path = find_depth_output(out_dir, stem)
+    scene.use_nodes = False
 
-    depth = np.asarray(result.pixels[:], dtype=np.float32)
-    # Render Result pixels expose Combined pass. For Z/Normal, use passes via
-    # direct view layer buffers when available; fallback below uses compositor-free
-    # render result layer API, which is stable in Blender 4.x.
-    layer = result.view_layers[0]
-    z_pass = np.asarray(layer.passes["Depth"].rect, dtype=np.float32).reshape(scene.render.resolution_y, scene.render.resolution_x, 4)[..., 0]
-    n_pass = np.asarray(layer.passes["Normal"].rect, dtype=np.float32).reshape(scene.render.resolution_y, scene.render.resolution_x, 4)[..., :3]
-
-    finite = np.isfinite(z_pass)
-    valid = finite & (z_pass > 0) & (z_pass < 99.0)
-    depth_out = np.where(valid, z_pass, 0.0).astype(np.float32)
-    np.save(out_dir / f"{stem}_depth.npy", depth_out)
-
-    if valid.any():
-        near = float(np.percentile(depth_out[valid], 1))
-        far = float(np.percentile(depth_out[valid], 99))
-        denom = max(far - near, 1e-6)
-        depth_norm = np.clip((depth_out - near) / denom, 0.0, 1.0)
-        depth_u16 = (depth_norm * 65535.0).astype(np.uint16)
-    else:
-        depth_u16 = np.zeros_like(depth_out, dtype=np.uint16)
-    Image.fromarray(depth_u16, mode="I;16").save(out_dir / f"{stem}_depth.png")
-
-    normal_u8 = np.clip((n_pass * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8)
-    normal_u8[~valid] = 127
-    Image.fromarray(normal_u8, mode="RGB").save(out_dir / f"{stem}_normal.png")
+    set_render_png_rgba()
+    normal_mat = make_normal_material()
+    view_layer.material_override = normal_mat
+    scene.render.filepath = str(out_dir / f"{stem}_normal.png")
+    bpy.ops.render.render(write_still=True)
+    view_layer.material_override = None
+    return depth_path, out_dir / f"{stem}_normal.png"
 
 
 def process_uid(uid, args, dataset_root, mask_root, out_base):
