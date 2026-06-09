@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--steps_per_epoch", type=int, default=0, help="0 means one pass over dataset items.")
     p.add_argument("--val_steps", type=int, default=50)
+    p.add_argument("--val_train_objects", type=int, default=0, help="Also validate on the first N train objects.")
     p.add_argument("--max_train_objects", type=int, default=0)
     p.add_argument("--max_val_objects", type=int, default=0)
     p.add_argument("--overfit_objects", type=int, default=0, help="Use the first N train objects for both train and val.")
@@ -410,7 +411,7 @@ def build_model(args: argparse.Namespace):
             for i in range(len(channels) - 1):
                 blocks += [
                     nn.Conv2d(channels[i], channels[i + 1], 4, stride=2, padding=1),
-                    nn.BatchNorm2d(channels[i + 1]),
+                    nn.GroupNorm(min(8, channels[i + 1]), channels[i + 1]),
                     nn.SiLU(inplace=True),
                 ]
             self.net = nn.Sequential(*blocks)
@@ -589,8 +590,16 @@ def train(args: argparse.Namespace) -> None:
     train_uids, val_uids, _ = load_splits(args)
     train_ds = ChairGeometryDataset(args, train_uids, training=True)
     val_ds = ChairGeometryDataset(args, val_uids or train_uids[: max(1, min(8, len(train_uids)))], training=False)
+    seen_val_ds = None
+    if args.val_train_objects > 0:
+        seen_val_ds = ChairGeometryDataset(args, train_uids[: args.val_train_objects], training=False)
     train_loader = make_loader(train_ds, args.batch_size, args.num_workers, shuffle=True)
     val_loader = make_loader(val_ds, args.batch_size, max(0, min(args.num_workers, 2)), shuffle=False)
+    seen_val_loader = (
+        make_loader(seen_val_ds, args.batch_size, max(0, min(args.num_workers, 2)), shuffle=False)
+        if seen_val_ds is not None
+        else None
+    )
     train_iter = cycle_loader(train_loader)
 
     model = build_model(args).to(device)
@@ -617,7 +626,8 @@ def train(args: argparse.Namespace) -> None:
         world = int(os.environ.get("WORLD_SIZE", "1"))
         print(
             f"[train] device={device} world_size={world} train_rows={len(train_ds)} "
-            f"val_rows={len(val_ds)} steps_per_epoch={steps_per_epoch} batch_per_gpu={args.batch_size}",
+            f"val_rows={len(val_ds)} seen_val_rows={0 if seen_val_ds is None else len(seen_val_ds)} "
+            f"steps_per_epoch={steps_per_epoch} batch_per_gpu={args.batch_size}",
             flush=True,
         )
 
@@ -647,16 +657,19 @@ def train(args: argparse.Namespace) -> None:
                 print(f"[train] epoch={epoch} step={global_step} loss={statistics_mean(losses):.5f}", flush=True)
 
         val_loss = validate(model, val_loader, args, device, dtype, use_amp)
+        seen_val_loss = validate(model, seen_val_loader, args, device, dtype, use_amp) if seen_val_loader is not None else float("nan")
         train_loss = statistics_mean(losses)
         if is_distributed():
-            values = torch.tensor([train_loss, val_loss], dtype=torch.float32, device=device)
+            values = torch.tensor([train_loss, val_loss, seen_val_loss], dtype=torch.float32, device=device)
             dist.all_reduce(values, op=dist.ReduceOp.AVG)
             train_loss = float(values[0].cpu())
             val_loss = float(values[1].cpu())
+            seen_val_loss = float(values[2].cpu())
         elapsed = time.time() - start
         if is_main_process():
             print(
-                f"[epoch] {epoch}/{args.epochs} train={train_loss:.5f} val={val_loss:.5f} sec={elapsed:.1f}",
+                f"[epoch] {epoch}/{args.epochs} train={train_loss:.5f} "
+                f"seen_val={seen_val_loss:.5f} val={val_loss:.5f} sec={elapsed:.1f}",
                 flush=True,
             )
             with open(log_path, "a", encoding="utf-8", newline="") as f:
