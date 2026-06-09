@@ -65,6 +65,8 @@ def parse_args():
     p.add_argument("--preview_ray_chunk", type=int, default=4096)
     p.add_argument("--preview_same_view", action="store_true")
     p.add_argument("--preview_train", action="store_true")
+    p.add_argument("--train_preview_every", type=int, default=0)
+    p.add_argument("--train_preview_size", type=int, default=128)
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)

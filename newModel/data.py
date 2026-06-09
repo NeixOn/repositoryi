@@ -229,6 +229,10 @@ class RenderPairDataset:
 
         return {
             "uid": uid,
+            "source_path": source["image_path"],
+            "target_path": target["image_path"],
+            "source_view": source["view"],
+            "target_view": target["view"],
             "source_image": source_image.astype(np.float32),
             "rays_o": rays_o,
             "rays_d": rays_d,
@@ -246,5 +250,8 @@ def collate_batch(batch):
     for key in ("source_image", "rays_o", "rays_d", "target_rgb", "target_mask", "geo_query", "geo_target"):
         out[key] = torch.from_numpy(np.stack([item[key] for item in batch], axis=0))
     out["uid"] = [item["uid"] for item in batch]
+    out["source_path"] = [item["source_path"] for item in batch]
+    out["target_path"] = [item["target_path"] for item in batch]
+    out["source_view"] = [item["source_view"] for item in batch]
+    out["target_view"] = [item["target_view"] for item in batch]
     return out
-

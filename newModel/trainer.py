@@ -13,6 +13,7 @@ import numpy as np
 
 from .checkpoints import load_checkpoint_if_requested, save_checkpoint
 from .data import RenderPairDataset, collate_batch, read_dataset, read_excluded_uids, split_uids
+from .debug_views import save_train_step_preview
 from .deps import ensure_deps
 from .losses import build_perceptual_model, geometry_density_loss, perceptual_patch_loss, render_losses, stage_weights
 from .model import build_model, make_optimizer, set_encoder_trainable
@@ -115,6 +116,7 @@ def train_one_epoch(
     device,
     amp_dtype,
     rank: int,
+    work_dir: Path,
 ):
     import torch
 
@@ -162,6 +164,23 @@ def train_one_epoch(
         geo_loss = geometry_density_loss(module, planes.float(), geo_query.float(), geo_target.float())
         loss = loss + args.geometry_weight * stage.get("geometry", 1.0) * geo_loss
         parts["geo"] = geo_loss.detach()
+
+        real_loss_for_preview = float(loss.detach().cpu())
+        if rank == 0 and args.train_preview_every > 0 and (step == 1 or step % args.train_preview_every == 0):
+            preview_path = save_train_step_preview(
+                work_dir=work_dir,
+                epoch=epoch,
+                step=step,
+                batch=batch,
+                pred_rgb=pred_rgb.float(),
+                pred_mask=pred_mask.float(),
+                loss_value=real_loss_for_preview,
+                parts=parts,
+                patch_size=args.patch_size,
+                preview_size=args.train_preview_size,
+            )
+            print(f"train step preview saved: {preview_path}", flush=True)
+
         loss = loss / args.grad_accum
 
         scaler.scale(loss).backward()
@@ -315,7 +334,7 @@ def train(args):
             encoder_trainable = True
 
         train_losses, train_parts, stage, start = train_one_epoch(
-            model, train_loader, train_sampler, optimizer, scaler, perceptual_model, args, epoch, device, amp_dtype, rank
+            model, train_loader, train_sampler, optimizer, scaler, perceptual_model, args, epoch, device, amp_dtype, rank, work_dir
         )
         if distributed:
             torch.distributed.barrier()
