@@ -636,6 +636,33 @@ def validate(model, loader, args, device, dtype, use_amp: bool) -> float:
     return statistics_mean(losses)
 
 
+def write_obj(path: Path, verts: np.ndarray, faces: np.ndarray) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# chair_geometry_baseline mesh\n")
+        for v in verts:
+            f.write(f"v {float(v[0]):.7f} {float(v[1]):.7f} {float(v[2]):.7f}\n")
+        for face in faces:
+            # OBJ is 1-indexed.
+            f.write(f"f {int(face[0]) + 1} {int(face[1]) + 1} {int(face[2]) + 1}\n")
+
+
+def write_ply(path: Path, verts: np.ndarray, faces: np.ndarray) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(verts)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write(f"element face {len(faces)}\n")
+        f.write("property list uchar int vertex_indices\n")
+        f.write("end_header\n")
+        for v in verts:
+            f.write(f"{float(v[0]):.7f} {float(v[1]):.7f} {float(v[2]):.7f}\n")
+        for face in faces:
+            f.write(f"3 {int(face[0])} {int(face[1])} {int(face[2])}\n")
+
+
 def check(args: argparse.Namespace) -> None:
     train_uids, val_uids, test_uids = load_splits(args)
     print(f"dataset_root: {args.dataset_root}")
@@ -661,9 +688,8 @@ def predict(args: argparse.Namespace) -> None:
 
     try:
         from skimage import measure
-        import trimesh
     except Exception as exc:
-        raise RuntimeError("predict mode needs scikit-image and trimesh installed in the Kaggle environment.") from exc
+        raise RuntimeError("predict mode needs scikit-image installed in the Kaggle environment.") from exc
 
     ckpt_path = Path(args.checkpoint)
     if not ckpt_path.exists():
@@ -704,7 +730,7 @@ def predict(args: argparse.Namespace) -> None:
                 print(f"[predict] grid slice {zi + 1}/{args.grid_resolution}", flush=True)
 
     np.save(out_dir / "field.npy", field)
-    verts, faces, normals, _ = measure.marching_cubes(
+    verts, faces, _normals, _ = measure.marching_cubes(
         field,
         level=args.mc_level,
         spacing=(
@@ -716,9 +742,8 @@ def predict(args: argparse.Namespace) -> None:
     verts[:, 0] += lo[0]
     verts[:, 1] += lo[1]
     verts[:, 2] += lo[2]
-    mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals, process=True)
-    mesh.export(out_dir / "mesh.ply")
-    mesh.export(out_dir / "mesh.obj")
+    write_ply(out_dir / "mesh.ply", verts, faces)
+    write_obj(out_dir / "mesh.obj", verts, faces)
     print(f"[predict] saved {out_dir / 'mesh.obj'}")
 
 
