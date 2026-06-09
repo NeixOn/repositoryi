@@ -1,0 +1,26 @@
+{
+  "dataset_name": "objaverse_chairs_blender",
+  "objects": 500,
+  "views": 24,
+  "resolution": 512,
+  "points_per_object": 32768,
+  "modalities": ["rgb", "mask", "camera", "mesh", "points"],
+  "view_layout": {
+    "horizontal_views": 12,
+    "upper_views": 12,
+    "azimuth_step_degrees": 30.0,
+    "axis": "Z"
+  },
+  "recommended_kaggle_paths": {
+    "dataset_root": "/kaggle/input/objaverse-chairs-blender/objaverse_chairs_blender",
+    "repo_root": "/kaggle/working/repositoryi",
+    "audit_output": "/kaggle/working/chair_dataset_audit",
+    "repaired_masks": "/kaggle/working/repaired_masks"
+  },
+  "acceptance": {
+    "min_fg_ratio": 0.002,
+    "max_fg_ratio": 0.9,
+    "max_edge_touch_ratio": 0.18,
+    "mask_binary_tolerance": 0.03
+  }
+}
