@@ -70,17 +70,33 @@ def parse_args():
         first = next((i for i, item in enumerate(argv) if item in known), None)
         argv = argv[first:] if first is not None else []
     p = argparse.ArgumentParser()
-    p.add_argument("--manifest", required=True)
-    p.add_argument("--dataset-root", required=True)
-    p.add_argument("--mask-root", required=True)
-    p.add_argument("--output-root", required=True)
-    p.add_argument("--views", type=int, required=True)
-    p.add_argument("--resolution", type=int, required=True)
-    p.add_argument("--worker-id", type=int, required=True)
-    p.add_argument("--total-workers", type=int, required=True)
+    p.add_argument("--manifest", default=os.environ.get("CHAIR_RENDER_MANIFEST"))
+    p.add_argument("--dataset-root", default=os.environ.get("CHAIR_RENDER_DATASET_ROOT"))
+    p.add_argument("--mask-root", default=os.environ.get("CHAIR_RENDER_MASK_ROOT"))
+    p.add_argument("--output-root", default=os.environ.get("CHAIR_RENDER_OUTPUT_ROOT"))
+    p.add_argument("--views", type=int, default=int(os.environ.get("CHAIR_RENDER_VIEWS", "0") or "0"))
+    p.add_argument("--resolution", type=int, default=int(os.environ.get("CHAIR_RENDER_RESOLUTION", "0") or "0"))
+    p.add_argument("--worker-id", type=int, default=int(os.environ.get("CHAIR_RENDER_WORKER_ID", "-1") or "-1"))
+    p.add_argument("--total-workers", type=int, default=int(os.environ.get("CHAIR_RENDER_TOTAL_WORKERS", "0") or "0"))
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--device", default="CPU")
-    return p.parse_args()
+    args = p.parse_args(argv)
+    missing = [
+        name
+        for name in ("manifest", "dataset_root", "mask_root", "output_root")
+        if not getattr(args, name)
+    ]
+    if args.views <= 0:
+        missing.append("views")
+    if args.resolution <= 0:
+        missing.append("resolution")
+    if args.worker_id < 0:
+        missing.append("worker_id")
+    if args.total_workers <= 0:
+        missing.append("total_workers")
+    if missing:
+        p.error("Missing worker arguments/env: " + ", ".join(missing))
+    return args
 
 
 def clean_scene():
@@ -464,8 +480,21 @@ def main() -> int:
         ]
         if args.overwrite:
             cmd.append("--overwrite")
+        env = os.environ.copy()
+        env.update(
+            {
+                "CHAIR_RENDER_MANIFEST": str(manifest),
+                "CHAIR_RENDER_DATASET_ROOT": str(dataset_root),
+                "CHAIR_RENDER_MASK_ROOT": str(mask_root),
+                "CHAIR_RENDER_OUTPUT_ROOT": str(output_root),
+                "CHAIR_RENDER_VIEWS": str(args.views),
+                "CHAIR_RENDER_RESOLUTION": str(args.resolution),
+                "CHAIR_RENDER_WORKER_ID": str(worker_id),
+                "CHAIR_RENDER_TOTAL_WORKERS": str(len(manifests)),
+            }
+        )
         print(f"[master] starting worker={worker_id} objects={count}", flush=True)
-        procs.append((worker_id, subprocess.Popen(cmd)))
+        procs.append((worker_id, subprocess.Popen(cmd, env=env)))
 
     exit_code = 0
     for worker_id, proc in procs:
