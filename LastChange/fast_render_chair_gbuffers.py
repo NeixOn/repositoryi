@@ -52,6 +52,23 @@ def parse_args():
     argv = sys.argv
     if "--" in argv:
         argv = argv[argv.index("--") + 1:]
+    elif "--manifest" in argv:
+        argv = argv[argv.index("--manifest"):]
+    else:
+        known = {
+            "--manifest",
+            "--dataset-root",
+            "--mask-root",
+            "--output-root",
+            "--views",
+            "--resolution",
+            "--worker-id",
+            "--total-workers",
+            "--overwrite",
+            "--device",
+        }
+        first = next((i for i, item in enumerate(argv) if item in known), None)
+        argv = argv[first:] if first is not None else []
     p = argparse.ArgumentParser()
     p.add_argument("--manifest", required=True)
     p.add_argument("--dataset-root", required=True)
