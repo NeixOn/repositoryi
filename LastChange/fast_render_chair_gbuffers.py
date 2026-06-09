@@ -35,8 +35,10 @@ from pathlib import Path
 
 BLENDER_WORKER = r'''
 import argparse
+import contextlib
 import json
 import math
+import os
 import shutil
 import sys
 import time
@@ -46,6 +48,24 @@ import bpy
 import mathutils
 import numpy as np
 from PIL import Image
+
+
+@contextlib.contextmanager
+def suppress_native_output():
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_stdout = os.dup(1)
+    saved_stderr = os.dup(2)
+    try:
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), 1)
+            os.dup2(devnull.fileno(), 2)
+        yield
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.dup2(saved_stderr, 2)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
 
 
 def parse_args():
@@ -143,12 +163,13 @@ def configure_scene(resolution, device):
 
 def import_mesh(path):
     ext = Path(path).suffix.lower()
-    if ext in (".glb", ".gltf"):
-        bpy.ops.import_scene.gltf(filepath=str(path))
-    elif ext == ".obj":
-        bpy.ops.wm.obj_import(filepath=str(path))
-    else:
-        raise RuntimeError(f"Unsupported mesh extension: {ext}")
+    with suppress_native_output():
+        if ext in (".glb", ".gltf"):
+            bpy.ops.import_scene.gltf(filepath=str(path))
+        elif ext == ".obj":
+            bpy.ops.wm.obj_import(filepath=str(path))
+        else:
+            raise RuntimeError(f"Unsupported mesh extension: {ext}")
     meshes = [obj for obj in bpy.context.scene.objects if obj.type == "MESH"]
     if not meshes:
         raise RuntimeError("No mesh objects imported")
@@ -270,7 +291,8 @@ def render_depth_normal(out_dir, stem):
     setup_depth_nodes(out_dir, stem)
     view_layer.material_override = None
     scene.render.filepath = str(out_dir / f"{stem}_unused.png")
-    bpy.ops.render.render(write_still=False)
+    with suppress_native_output():
+        bpy.ops.render.render(write_still=False)
     depth_path = find_depth_output(out_dir, stem)
     scene.use_nodes = False
 
@@ -278,7 +300,8 @@ def render_depth_normal(out_dir, stem):
     normal_mat = make_normal_material()
     view_layer.material_override = normal_mat
     scene.render.filepath = str(out_dir / f"{stem}_normal.png")
-    bpy.ops.render.render(write_still=True)
+    with suppress_native_output():
+        bpy.ops.render.render(write_still=True)
     view_layer.material_override = None
     return depth_path, out_dir / f"{stem}_normal.png"
 
@@ -511,6 +534,13 @@ def main() -> int:
         f"failed_objects={len(fail_files)} output={output_root}",
         flush=True,
     )
+    if len(done_files) < len(uids) and not args.dry_run:
+        print(
+            f"[master] ERROR: expected {len(uids)} done objects, got {len(done_files)}. "
+            "Check worker tracebacks above or _failures.",
+            flush=True,
+        )
+        return exit_code or 1
     return exit_code
 
 
