@@ -585,6 +585,7 @@ def train(args: argparse.Namespace) -> None:
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
 
+    device = setup_distributed()
     train_uids, val_uids, _ = load_splits(args)
     train_ds = ChairGeometryDataset(args, train_uids, training=True)
     val_ds = ChairGeometryDataset(args, val_uids or train_uids[: max(1, min(8, len(train_uids)))], training=False)
@@ -592,7 +593,6 @@ def train(args: argparse.Namespace) -> None:
     val_loader = make_loader(val_ds, args.batch_size, max(0, min(args.num_workers, 2)), shuffle=False)
     train_iter = cycle_loader(train_loader)
 
-    device = setup_distributed()
     model = build_model(args).to(device)
     if is_distributed():
         model = DDP(model, device_ids=[device.index], output_device=device.index)
