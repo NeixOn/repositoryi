@@ -23,6 +23,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -513,15 +514,53 @@ def build_model(args: argparse.Namespace):
 def make_loader(ds, batch_size: int, workers: int, shuffle: bool):
     import torch
 
+    sampler = None
+    if is_distributed():
+        sampler = torch.utils.data.distributed.DistributedSampler(ds, shuffle=shuffle, drop_last=shuffle)
     return torch.utils.data.DataLoader(
         ds,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle and sampler is None,
+        sampler=sampler,
         num_workers=workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=shuffle,
         collate_fn=collate,
     )
+
+
+def is_distributed() -> bool:
+    return int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+
+def get_rank() -> int:
+    return int(os.environ.get("RANK", "0"))
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+def setup_distributed():
+    import torch
+    import torch.distributed as dist
+
+    if not is_distributed():
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return device
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return torch.device("cuda", local_rank)
+
+
+def cleanup_distributed() -> None:
+    if not is_distributed():
+        return
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def cycle_loader(loader):
@@ -543,6 +582,8 @@ def amp_dtype(args: argparse.Namespace):
 def train(args: argparse.Namespace) -> None:
     import torch
     import torch.nn.functional as F
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
 
     train_uids, val_uids, _ = load_splits(args)
     train_ds = ChairGeometryDataset(args, train_uids, training=True)
@@ -551,26 +592,38 @@ def train(args: argparse.Namespace) -> None:
     val_loader = make_loader(val_ds, args.batch_size, max(0, min(args.num_workers, 2)), shuffle=False)
     train_iter = cycle_loader(train_loader)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = setup_distributed()
     model = build_model(args).to(device)
+    if is_distributed():
+        model = DDP(model, device_ids=[device.index], output_device=device.index)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and args.amp == "fp16"))
     dtype = amp_dtype(args)
     use_amp = device.type == "cuda" and dtype is not None
 
     work_dir = Path(args.work_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
-    (work_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
+    if is_main_process():
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     log_path = work_dir / "train_log.csv"
-    with open(log_path, "w", encoding="utf-8", newline="") as f:
-        csv.DictWriter(f, fieldnames=["epoch", "step", "train_loss", "val_loss", "lr"]).writeheader()
+    if is_main_process():
+        with open(log_path, "w", encoding="utf-8", newline="") as f:
+            csv.DictWriter(f, fieldnames=["epoch", "step", "train_loss", "val_loss", "lr"]).writeheader()
 
     steps_per_epoch = args.steps_per_epoch or max(1, len(train_loader))
     best = float("inf")
     global_step = 0
-    print(f"[train] device={device} train_rows={len(train_ds)} val_rows={len(val_ds)} steps_per_epoch={steps_per_epoch}", flush=True)
+    if is_main_process():
+        world = int(os.environ.get("WORLD_SIZE", "1"))
+        print(
+            f"[train] device={device} world_size={world} train_rows={len(train_ds)} "
+            f"val_rows={len(val_ds)} steps_per_epoch={steps_per_epoch} batch_per_gpu={args.batch_size}",
+            flush=True,
+        )
 
     for epoch in range(1, args.epochs + 1):
+        if is_distributed() and hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(epoch)
         model.train()
         start = time.time()
         losses = []
@@ -590,26 +643,34 @@ def train(args: argparse.Namespace) -> None:
             scaler.update()
             losses.append(float(loss.detach().cpu()))
             global_step += 1
-            if global_step % args.log_every == 0:
+            if is_main_process() and global_step % args.log_every == 0:
                 print(f"[train] epoch={epoch} step={global_step} loss={statistics_mean(losses):.5f}", flush=True)
 
         val_loss = validate(model, val_loader, args, device, dtype, use_amp)
         train_loss = statistics_mean(losses)
+        if is_distributed():
+            values = torch.tensor([train_loss, val_loss], dtype=torch.float32, device=device)
+            dist.all_reduce(values, op=dist.ReduceOp.AVG)
+            train_loss = float(values[0].cpu())
+            val_loss = float(values[1].cpu())
         elapsed = time.time() - start
-        print(
-            f"[epoch] {epoch}/{args.epochs} train={train_loss:.5f} val={val_loss:.5f} sec={elapsed:.1f}",
-            flush=True,
-        )
-        with open(log_path, "a", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["epoch", "step", "train_loss", "val_loss", "lr"])
-            writer.writerow({"epoch": epoch, "step": global_step, "train_loss": train_loss, "val_loss": val_loss, "lr": args.lr})
+        if is_main_process():
+            print(
+                f"[epoch] {epoch}/{args.epochs} train={train_loss:.5f} val={val_loss:.5f} sec={elapsed:.1f}",
+                flush=True,
+            )
+            with open(log_path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["epoch", "step", "train_loss", "val_loss", "lr"])
+                writer.writerow({"epoch": epoch, "step": global_step, "train_loss": train_loss, "val_loss": val_loss, "lr": args.lr})
 
-        state = {"model": model.state_dict(), "args": vars(args), "epoch": epoch, "val_loss": val_loss}
-        torch.save(state, work_dir / "last.pt")
-        if val_loss < best:
-            best = val_loss
-            torch.save(state, work_dir / "best.pt")
-            print(f"[ckpt] saved best.pt val={best:.5f}", flush=True)
+            module = model.module if hasattr(model, "module") else model
+            state = {"model": module.state_dict(), "args": vars(args), "epoch": epoch, "val_loss": val_loss}
+            torch.save(state, work_dir / "last.pt")
+            if val_loss < best:
+                best = val_loss
+                torch.save(state, work_dir / "best.pt")
+                print(f"[ckpt] saved best.pt val={best:.5f}", flush=True)
+    cleanup_distributed()
 
 
 def statistics_mean(values: list[float]) -> float:
