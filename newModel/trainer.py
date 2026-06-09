@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from .checkpoints import load_checkpoint_if_requested, save_checkpoint
+from .constants import BOX_MAX, BOX_MIN
 from .data import RenderPairDataset, collate_batch, read_dataset, read_excluded_uids, split_uids
 from .debug_views import save_train_step_preview
 from .deps import ensure_deps
@@ -174,6 +175,10 @@ def train_one_epoch(
                 batch=batch,
                 pred_rgb=pred_rgb.float(),
                 pred_mask=pred_mask.float(),
+                rays_o=rays_o,
+                rays_d=rays_d,
+                box_min=BOX_MIN,
+                box_max=BOX_MAX,
                 loss_value=real_loss_for_preview,
                 parts=parts,
                 patch_size=args.patch_size,
