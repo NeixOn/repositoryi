@@ -178,6 +178,7 @@ def train_one_epoch(
                 parts=parts,
                 patch_size=args.patch_size,
                 preview_size=args.train_preview_size,
+                inline_display=args.inline_train_preview,
             )
             print(f"train step preview saved: {preview_path}", flush=True)
 

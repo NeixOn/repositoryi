@@ -45,6 +45,7 @@ def save_train_step_preview(
     parts: dict,
     patch_size: int,
     preview_size: int,
+    inline_display: bool = False,
 ):
     from PIL import Image, ImageDraw
 
@@ -82,4 +83,11 @@ def save_train_step_preview(
 
     out_path = out_dir / f"step_{step:05d}_{uid}_s{source_view:03d}_t{target_view:03d}.jpg"
     sheet.save(out_path, quality=92)
+    if inline_display:
+        try:
+            from IPython.display import display
+
+            display(sheet)
+        except Exception as exc:
+            print(f"inline preview display failed: {exc}", flush=True)
     return out_path
