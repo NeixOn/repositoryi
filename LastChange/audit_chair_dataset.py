@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_ratio", type=float, default=0.80)
     parser.add_argument("--val_ratio", type=float, default=0.10)
     parser.add_argument("--fail_on_blockers", action="store_true")
+    parser.add_argument("--no_auto_find", action="store_true", help="Disable automatic dataset-root discovery.")
     return parser.parse_args()
 
 
@@ -149,6 +150,75 @@ def discover_uids(dataset_root: Path) -> list[str]:
                     seen.add(child.name)
                     ordered.append(child.name)
     return ordered
+
+
+def looks_like_dataset_root(path: Path) -> bool:
+    required_any = (
+        path / "metadata" / "views.csv",
+        path / "renders",
+        path / "objects",
+    )
+    return any(item.exists() for item in required_any)
+
+
+def find_dataset_roots(start: Path, max_depth: int = 4) -> list[Path]:
+    if not start.exists():
+        return []
+    found: list[Path] = []
+    stack: list[tuple[Path, int]] = [(start, 0)]
+    while stack:
+        path, depth = stack.pop()
+        if looks_like_dataset_root(path):
+            found.append(path)
+            continue
+        if depth >= max_depth:
+            continue
+        try:
+            children = sorted([child for child in path.iterdir() if child.is_dir()])
+        except OSError:
+            continue
+        for child in reversed(children):
+            stack.append((child, depth + 1))
+    return found
+
+
+def maybe_autofind_dataset_root(dataset_root: Path, args: argparse.Namespace) -> Path:
+    if args.no_auto_find or looks_like_dataset_root(dataset_root):
+        return dataset_root
+
+    search_roots = [dataset_root]
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.exists() and kaggle_input not in search_roots:
+        search_roots.append(kaggle_input)
+
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for root in search_roots:
+        for candidate in find_dataset_roots(root):
+            resolved = candidate.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                candidates.append(resolved)
+
+    if not candidates:
+        return dataset_root
+
+    def score(path: Path) -> tuple[int, int, str]:
+        points = 0
+        for item in ("metadata", "renders", "masks", "cameras", "objects"):
+            if (path / item).exists():
+                points += 1
+        if (path / "metadata" / "views.csv").exists():
+            points += 3
+        return points, -len(path.parts), str(path)
+
+    best = sorted(candidates, key=score, reverse=True)[0]
+    print(f"[audit] dataset_root did not look valid; auto-selected: {best}", flush=True)
+    if len(candidates) > 1:
+        print("[audit] other candidate roots:", flush=True)
+        for candidate in sorted(candidates, key=score, reverse=True)[1:8]:
+            print(f"[audit]   {candidate}", flush=True)
+    return best
 
 
 def relpath(path: Path, root: Path) -> str:
@@ -547,6 +617,7 @@ def make_splits(out_dir: Path, clean_uids: list[str], args: argparse.Namespace) 
 def main() -> int:
     args = parse_args()
     dataset_root = Path(args.dataset_root).expanduser().resolve()
+    dataset_root = maybe_autofind_dataset_root(dataset_root, args)
     out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else dataset_root / "audit_report"
     out_dir.mkdir(parents=True, exist_ok=True)
     mask_root = Path(args.mask_output_dir).expanduser().resolve() if args.mask_output_dir else dataset_root / "masks"
